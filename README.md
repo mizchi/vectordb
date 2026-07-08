@@ -72,11 +72,29 @@ moon run cmd/bench --target native --release   # ベンチ（Rustと同条件）
 # SIMD の効き比較: --target wasm（v128有効） vs --target wasm-gc（スカラ）
 ```
 
-速度メモ（50k×128, cosine, 参考値）:
-- 現状 Rust(AVX2) が MoonBit(native) より約1桁速い。
-- `wasm` ターゲットでは f32 距離が `wasm-gc`(スカラ)比で約2倍速く、v128 SIMD が
-  効いていることを確認済み。一方 **native バックエンドは現状 v128 を実SIMD命令へ
-  落とさずスカラ相当**（int8 と exact がほぼ同速）。
+### バックエンド別の速度メモ（int8 only / exact f32, ms/query, 参考値）
+
+| 経路 | int8 | exact | 備考 |
+|---|---|---|---|
+| native（既定 = 内蔵 tcc の `tcc -run`） | 最速 | ≈int8 | v128 は**スカラ相当**（int8≈exact） |
+| native + clang（`MOON_CC=clang`） | ≈tcc | ≈tcc | tcc とほぼ同じ。v128 は依然スカラ |
+| 新 native（`MOONBIT_NEW_NATIVE=1` + clang） | 遅い | 遅い | 動くが安定版では未最適化。v128 も実SIMD化されず |
+| **wasm（v128 SIMD）** | 速い | 速い | **v128 が実効**（exact が wasm-gc スカラ比で約2倍速） |
+| llvm | — | — | 真の最適化 native 経路だが**安定版では無効**（nightly 限定） |
+
+要点:
+- MoonBit で**ハードウェア SIMD を実際に使うなら現状 `--target wasm`**。native（tcc /
+  新backend いずれも）は v128 をスカラ実行する。最適化 native SIMD は nightly の
+  `llvm` バックエンド待ち。
+- Rust(AVX2) は同条件で MoonBit native より約1桁速い。
+
+```bash
+# 参考: 各経路の測り方
+moon run cmd/bench --target native --release                       # 既定(tcc-run)
+MOON_CC=clang moon run cmd/bench --target native --release         # clangでビルド
+MOONBIT_NEW_NATIVE=1 MOON_CC=clang moon run cmd/bench --target native --release  # 新native
+moon run cmd/bench --target wasm   --release                       # v128 SIMD 実効
+```
 
 API:
 
