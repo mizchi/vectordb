@@ -1,5 +1,6 @@
 import {
   "moonbitlang/core/v128",
+  "moonbitlang/core/math",
 }
 
 // The core v128 SIMD intrinsics carry an "experimental" alert; silence it since

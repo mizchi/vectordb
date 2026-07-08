@@ -288,7 +288,15 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、`to
 
 構成: `distance.mbt`（SIMD 距離）/ `quantize.mbt`（int8 量子化）/
 `index.mbt`（Flat + rerank）/ `ivf.mbt`（IVF: k-means + nprobe）/
-`storage.mbt`（`.vecdb` 相互運用）。
+`hnsw.mbt`（HNSW グラフ）/ `storage.mbt`（`.vecdb` 相互運用）。
+
+HNSW も Rust 版と同設計:
+
+```moonbit
+let idx = @vectordb.HnswIndex::new(dim, @vectordb.Cosine, 16, 200)
+idx.add(1L, embedding)
+let hits = idx.search(query, 10, 64)   // (k, ef_search)
+```
 
 IVF は Rust 版と同設計、`.vecdb`（`VECDBIV1`）永続化も対応:
 

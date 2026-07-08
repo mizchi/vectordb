@@ -270,3 +270,71 @@ test "ivf bytes round-trip" {
     assert_eq(a[i].id, b[i].id)
   }
 }
+
+///|
+test "hnsw high recall vs exact (l2)" {
+  let n = 1500
+  let dim = 24
+  let rng = Rng::{ state: 0x1234_5678_9ABC_DEF0UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<n {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let hnsw = HnswIndex::new(dim, L2, 16, 200)
+  for i in 0..<n {
+    hnsw.add(ids[i], vectors[i])
+  }
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let k = 10
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<40 {
+    let q = vectors[t * 13 % n]
+    let got = hnsw.search(q, k, 64)
+    let truth = flat.search_exact(q, k)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.95)
+}
+
+///|
+test "hnsw cosine finds self" {
+  // Distinct random directions so each vector's nearest (by cosine) is itself.
+  let n = 500
+  let dim = 16
+  let rng = Rng::{ state: 0xF00DBABE_12345678UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<n {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let hnsw = HnswIndex::new(dim, Cosine, 16, 100)
+  for i in 0..<n {
+    hnsw.add(ids[i], vectors[i])
+  }
+  for t in 0..<20 {
+    let i = t * 23 % n
+    let hits = hnsw.search(vectors[i], 1, 32)
+    assert_eq(hits[0].id, ids[i])
+  }
+}
