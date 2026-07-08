@@ -307,9 +307,10 @@ let bytes = ivf.to_bytes()
 let restored = @vectordb.IvfIndex::from_bytes(bytes)
 ```
 
-IVF 形式も Rust とバイト互換（k-means が決定的になる構成 nlist=count で Rust `save` と
-272 バイト一致を確認済み。通常構成では k-means が言語間で異なるためバイトは違うが、
-どちらが書いたファイルも相手が `from_bytes`/`load` で読める）。
+IVF 形式は Rust と**相互に読める**（同じ `VECDBIV1` レイアウト）。ただし k-means++
+初期化の乱数列が言語間で異なるため、生成されるセル割当＝バイト列は一般に一致しない
+（どちらが書いたファイルも相手の `from_bytes`/`load` で正しく読める）。バイト単位で
+完全一致するのは決定的な Flat 形式のほう。
 
 ## フィルタ付き検索・削除
 

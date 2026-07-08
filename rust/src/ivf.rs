@@ -506,6 +506,61 @@ fn normalize(v: &[f32]) -> Vec<f32> {
     }
 }
 
+/// Small deterministic xorshift RNG for k-means++ seeding.
+struct KmRng(u64);
+impl KmRng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// k-means++ initialization: first centroid random, each subsequent chosen
+/// with probability proportional to its squared distance to the nearest
+/// already-chosen centroid.
+fn kmeanspp_init(data: &[f32], n: usize, dim: usize, nlist: usize) -> Vec<f32> {
+    let mut centroids = vec![0f32; nlist * dim];
+    let mut rng = KmRng(0x9E37_79B9_7F4A_7C15 ^ (n as u64).wrapping_mul(0x1000_0001B3));
+    let first = (rng.next_u64() as usize) % n;
+    centroids[0..dim].copy_from_slice(&data[first * dim..first * dim + dim]);
+
+    let mut d2 = vec![f32::INFINITY; n];
+    for c in 1..nlist {
+        let prev = &centroids[(c - 1) * dim..c * dim];
+        let mut sum = 0f64;
+        for (i, d2i) in d2.iter_mut().enumerate() {
+            let dd = l2sq_f32(&data[i * dim..(i + 1) * dim], prev);
+            if dd < *d2i {
+                *d2i = dd;
+            }
+            sum += *d2i as f64;
+        }
+        // Sample an index with probability proportional to d2.
+        let mut pick = n - 1;
+        if sum > 0.0 {
+            let mut target = rng.next_f64() * sum;
+            for (i, &d2i) in d2.iter().enumerate() {
+                target -= d2i as f64;
+                if target <= 0.0 {
+                    pick = i;
+                    break;
+                }
+            }
+        } else {
+            pick = (rng.next_u64() as usize) % n;
+        }
+        centroids[c * dim..(c + 1) * dim].copy_from_slice(&data[pick * dim..(pick + 1) * dim]);
+    }
+    centroids
+}
+
 /// Lloyd's k-means over row-major `data` (`n * dim`). Returns
 /// `(centroids [nlist*dim], assignment [n])`.
 pub(crate) fn kmeans(
@@ -516,13 +571,10 @@ pub(crate) fn kmeans(
     iters: usize,
     renorm: bool,
 ) -> (Vec<f32>, Vec<usize>) {
-    // Init: pick nlist points spread across the dataset (deterministic).
-    let mut centroids = vec![0f32; nlist * dim];
-    let stride = (n / nlist).max(1);
-    for c in 0..nlist {
-        let src = (c * stride) % n;
-        centroids[c * dim..(c + 1) * dim].copy_from_slice(&data[src * dim..(src + 1) * dim]);
-    }
+    // Init: k-means++ (D^2 seeding), deterministic via a fixed-seed RNG. This
+    // spreads the initial centroids far better than a strided pick, which
+    // markedly improves recall at low nprobe.
+    let mut centroids = kmeanspp_init(data, n, dim, nlist);
 
     let mut assign = vec![0usize; n];
     for _ in 0..iters.max(1) {

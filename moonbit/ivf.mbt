@@ -64,6 +64,57 @@ fn nearest_centroid(
 }
 
 ///|
+/// k-means++ (D^2) initialization, deterministic via a fixed-seed xorshift.
+fn kmeanspp_init(
+  data : Array[Array[Float]],
+  nlist : Int,
+) -> Array[Array[Float]] {
+  let n = data.length()
+  let mut rng : UInt64 = 0x9E3779B97F4A7C15UL ^ n.to_int64().reinterpret_as_uint64()
+  let next = fn() -> UInt64 {
+    let mut x = rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    rng = x
+    x
+  }
+  let unit = fn() -> Double {
+    (next() >> 11).reinterpret_as_int64().to_double() / 9007199254740992.0
+  }
+  let centroids : Array[Array[Float]] = []
+  let first = (next() % n.to_int64().reinterpret_as_uint64()).to_int()
+  centroids.push(copy_row(data[first]))
+  let d2 : Array[Float] = Array::make(n, (3.0e38 : Float))
+  for c in 1..<nlist {
+    let prev = centroids[c - 1]
+    let mut sum = 0.0
+    for i in 0..<n {
+      let dd = l2_arr(data[i], prev)
+      if dd < d2[i] {
+        d2[i] = dd
+      }
+      sum = sum + d2[i].to_double()
+    }
+    let mut pick = n - 1
+    if sum > 0.0 {
+      let mut target = unit() * sum
+      for i in 0..<n {
+        target = target - d2[i].to_double()
+        if target <= 0.0 {
+          pick = i
+          break
+        }
+      }
+    } else {
+      pick = (next() % n.to_int64().reinterpret_as_uint64()).to_int()
+    }
+    centroids.push(copy_row(data[pick]))
+  }
+  centroids
+}
+
+///|
 /// Lloyd's k-means over `data` (n rows of dim). Returns (centroids, assign).
 fn kmeans(
   data : Array[Array[Float]],
@@ -73,11 +124,7 @@ fn kmeans(
 ) -> (Array[Array[Float]], Array[Int]) {
   let n = data.length()
   let dim = data[0].length()
-  let stride = if n / nlist > 1 { n / nlist } else { 1 }
-  let centroids : Array[Array[Float]] = []
-  for c in 0..<nlist {
-    centroids.push(copy_row(data[(c * stride) % n]))
-  }
+  let centroids = kmeanspp_init(data, nlist)
   let assign = Array::make(n, 0)
   let it_n = if iters < 1 { 1 } else { iters }
   for _it in 0..<it_n {
