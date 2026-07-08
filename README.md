@@ -176,7 +176,25 @@ API:
 ```moonbit
 let idx = @vectordb.FlatIndex::build(vectors, ids, @vectordb.Cosine, true)
 let hits = idx.search(query, 10, 4)   // Array[Hit{ id, score }]
+
+// .vecdb シリアライズ（Rust とバイト互換）
+let bytes = idx.to_bytes()                    // FixedArray[Byte]
+let restored = @vectordb.FlatIndex::from_bytes(bytes)
 ```
+
+### Rust ⇄ MoonBit の相互運用（`.vecdb` バイト互換）
+
+MoonBit の `to_bytes` は Rust の `save` と**バイト単位で同一の出力**を生成する
+（`storage.mbt` が同じ 64B ヘッダ + 16B 整列セクションを実装）。検証:
+
+```bash
+cd rust    && cargo run --release --example dump  # 同一の小インデックスを save→hex
+cd moonbit && moon run cmd/dump --target wasm     # 同じ内容を to_bytes→hex
+# → 192 バイトが完全一致（Rust が書いた .vecdb を MoonBit が読め、その逆も可能）
+```
+
+MoonBit の wasm ランタイムにファイルシステムは無いため、`to_bytes`/`from_bytes` は
+バイト列を扱う（ファイル入出力はホスト側が担当）。
 
 構成: `distance.mbt`（SIMD 距離）/ `quantize.mbt`（int8 量子化）/
 `index.mbt`（Flat + rerank）。

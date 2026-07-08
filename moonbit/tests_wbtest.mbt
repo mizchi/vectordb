@@ -177,3 +177,33 @@ test "int8+rerank recall vs exact on random data" {
   let recall = hit.to_double() / total.to_double()
   assert_true(recall >= 0.95)
 }
+
+///|
+test "vecdb bytes round-trip (with raw)" {
+  let vectors : Array[Array[Float]] = [
+    [1.0, 2.0, 3.0],
+    [-1.0, 0.5, 4.0],
+    [0.0, 0.0, 1.0],
+  ]
+  let ids : Array[Int64] = [1L, 2L, 3L]
+  let idx = FlatIndex::build(vectors, ids, L2, true)
+  let bytes = idx.to_bytes()
+  let back = FlatIndex::from_bytes(bytes)
+  assert_eq(back.length(), 3)
+  assert_true(back.has_raw())
+  let a = idx.search([1.0, 2.0, 3.0], 1, 4)
+  let b = back.search([1.0, 2.0, 3.0], 1, 4)
+  assert_eq(a[0].id, b[0].id)
+  assert_eq(b[0].id, 1L)
+}
+
+///|
+test "vecdb bytes round-trip (compact, no raw)" {
+  let vectors : Array[Array[Float]] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+  let ids : Array[Int64] = [7L, 8L]
+  let idx = FlatIndex::build(vectors, ids, Cosine, false)
+  let back = FlatIndex::from_bytes(idx.to_bytes())
+  assert_false(back.has_raw())
+  let hits = back.search([0.9, 0.1, 0.0, 0.0], 1, 1)
+  assert_eq(hits[0].id, 7L)
+}
