@@ -1,0 +1,7 @@
+import {
+  "moonbitlang/core/v128",
+}
+
+// The core v128 SIMD intrinsics carry an "experimental" alert; silence it since
+// we depend on them intentionally.
+warnings = "-alert_experimental"

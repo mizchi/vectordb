@@ -1,0 +1,15 @@
+# Rust
+/rust/target/
+**/*.rs.bk
+
+# MoonBit
+/moonbit/target/
+/moonbit/_build/
+.mooncakes/
+
+# Editor / OS
+*.swp
+.DS_Store
+
+# Local data
+*.vecdb

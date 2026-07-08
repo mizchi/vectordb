@@ -1,0 +1,22 @@
+[package]
+name = "vectordb"
+version = "0.1.0"
+edition = "2021"
+description = "Compact vector search DB: flat + int8 scalar quantization + rerank, mmap single-file"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "vecdb"
+path = "src/bin/vecdb.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"

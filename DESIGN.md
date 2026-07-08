@@ -1,0 +1,135 @@
+# vectordb — 設計と調査ノート
+
+コンパクトなベクトル検索に特化した組み込み向けDB。Rust を本命、MoonBit
+(`v128` SIMD) を試作として、同一の設計・同一のファイル形式で二本立てで実装する。
+
+- 方式: **Flat（総当り） + int8 スカラ量子化 + rerank**
+- 永続化: **mmap 単一ファイル**（`.vecdb`）
+- 目標: 小さいコード・小さいメモリ・依存最小・数十万件まで実用の速度
+
+---
+
+## 1. 調査: 先行実装
+
+| 実装 | 方式 | メモ |
+|---|---|---|
+| faiss (C++) | Flat/IVF/HNSW/PQ 全部入り | アルゴリズムの参照実装 |
+| qdrant (Rust) | HNSW + 量子化 + 独自ストレージ | Rust製本番DBの標準。設計の教科書 |
+| usearch (C++/Rust) | 単一ヘッダ HNSW | 「compact」の代表。依存最小・多言語FFI |
+| instant-distance (Rust) | HNSW | 純Rust・軽量 |
+| arroy (Rust) | LMDB + ランダム射影木 | mmap 永続化の好例（Meilisearch） |
+| rabitq-rs (Rust) | IVF + RaBitQ | 最新量子化の参照 |
+| lance/lancedb (Rust) | 列指向 + IVF_PQ/RaBitQ | ディスク常駐 |
+
+要点:
+- 「compact」路線 (usearch / instant-distance) は **依存を削り、距離計算の SIMD に
+  全力**、インデックスは素直、という構成。本プロジェクトもこれに倣う。
+- 量子化 + rerank が現在の定番パイプライン（粗選別→高精度再スコア）。
+
+## 2. 調査: インデックス方式
+
+- **Flat**: 厳密・最単純。SIMD があれば数万〜数十万件で実用。量子化との相性◎。
+- **IVF**: k-means でセル分割 → nprobe 個の近傍セルのみ探索。量子化と併用が定番。
+- **HNSW**: recall/速度は最良だが、グラフのエッジ分メモリが重く、コード量も多い。
+  `M=16–32`, `efConstruction=200–500`, `efSearch≈2〜4×k`。
+- **DiskANN/Vamana**: 単層グラフ + ディスク常駐。大規模・省メモリ向け。
+
+→ 第一段階は **Flat**。IVF（セル分割）や HNSW は同じ距離カーネル/量子化の上に
+後段で載せられるよう、`distance` と `quantize` を独立モジュールに切る。
+
+## 3. 調査: 量子化（コンパクトさの要）
+
+| 手法 | 圧縮 | recall | 速度 | 備考 |
+|---|---|---|---|---|
+| int8 スカラ | 4x | 高いまま | ~3.7x | 実装単純・無難な中間解（**採用**） |
+| Product (PQ) | 〜64x | 中〜低 | 高 | サブベクトル分割 + コードブック, ADC |
+| Binary (1bit) | 32x | rerank併用で回復 | ~25x | ハミング距離 |
+| RaBitQ (SIGMOD'24/'25) | 32x | 理論誤差 O(1/√D) | 高 | 二値化の正統進化 |
+
+第一段階は **int8 スカラ量子化**。将来 PQ / RaBitQ を `quantize` に追加できる形にする。
+
+### int8 スカラ量子化（対称・per-vector）
+
+各ベクトル `x`（次元 D）について:
+
+```
+scale = max(|x_i|) / 127                 # per-vector, f32
+q_i   = round(x_i / scale)  ∈ [-127,127] # i8
+```
+
+- 内積 `x·y ≈ scale_x · scale_y · (q_x · q_y)`。`q_x·q_y` は int32 で SIMD 集計。
+- L2: `||x-y||² = ||x||² + ||y||² − 2 x·y`。`sqnorm` を per-vector で保持して復元。
+- Cosine: 挿入時に単位長へ正規化してから量子化 → cosine = dot。
+
+## 4. 調査: 最適化手法
+
+- **SIMD 距離計算**（最重要）
+  - Rust: `std::arch` の AVX2（`is_x86_feature_detected!` で実行時分岐）+ スカラ fallback。
+    nightly/外部crate 不要。
+  - MoonBit: `moonbitlang/core/v128`。f32 は `v128_load`/`f32x4_mul`/`f32x4_add`、
+    int8 は `v128_load8x8_s`（8バイト→i16x8 符号拡張ロード）+ `i32x4_dot_i16x8_s`
+    （i16x8 の対毎内積→i32x4）。intrinsic はスカラ fallback 付きで全ターゲット動作。
+- **メモリレイアウト**: ベクトルを連続配置（row-major、`count×dim`）。
+- **rerank**: int8 で候補を `k·over` 件に粗選別 → 生 f32 で再スコアし上位 k。
+- **並列化**: rayon（後段。まずは単スレッド）。
+- **永続化**: mmap でゼロコピーロード。
+
+## 5. アーキテクチャ
+
+```
+distance   距離カーネル（f32 / int8, scalar + SIMD）
+quantize   int8 スカラ量子化（encode/decode, scale/sqnorm）
+index      Flat インデックス（add / search / rerank）
+storage    .vecdb 単一ファイル（save / load / mmap）
+```
+
+同じ責務分割を Rust と MoonBit の双方に持たせ、ファイル形式を共有する。
+
+## 6. ファイル形式 `.vecdb`（little-endian, v1）
+
+固定 64B ヘッダ + 各セクション（16B 境界にパディング）。
+
+### ヘッダ（64 バイト）
+
+| off | size | 型 | 内容 |
+|---|---|---|---|
+| 0  | 8 | bytes | magic `"VECDB1\0\0"` |
+| 8  | 4 | u32 | version = 1 |
+| 12 | 4 | u32 | metric (0=L2, 1=Dot, 2=Cosine) |
+| 16 | 4 | u32 | dim |
+| 20 | 4 | u32 | count |
+| 24 | 4 | u32 | flags (bit0: raw f32 セクションあり) |
+| 28 | 4 | u32 | reserved |
+| 32 | 32 | — | reserved（0 埋め） |
+
+### セクション（この順、各先頭を 16B 境界へ整列）
+
+1. `ids`    : `count × u64` — 外部ID
+2. `scales` : `count × f32` — per-vector 量子化スケール
+3. `sqnorms`: `count × f32` — 格納ベクトルの二乗ノルム（L2 復元・cosine 検証用）
+4. `codes`  : `count × dim × i8` — int8 量子化コード（row-major）
+5. `raw`    : `count × dim × f32` — 生ベクトル（flags bit0 のときのみ。rerank/厳密用）
+
+`raw` を省くと最小サイズ（int8 のみ、rerank 不可）。含めると int8 スキャン +
+f32 rerank の両立。Rust と MoonBit で同一バイト列を読み書きでき、相互運用可能。
+
+## 7. 検索パイプライン
+
+```
+query(f32)
+ ├─ (cosine なら) 正規化
+ ├─ int8 量子化（scale_q, sqnorm_q）
+ ├─ 全件スキャン: metric ごとに int8 近似距離を計算（SIMD）
+ │    Dot   : approx = scale_x·scale_q·(q_x·q_q)
+ │    Cosine: 同上（正規化済み）
+ │    L2    : sqnorm_x + sqnorm_q − 2·approx_dot
+ ├─ 上位 k·over を候補に（min-heap / partial sort）
+ └─ rerank: raw f32 があれば厳密距離で再スコア → 上位 k
+```
+
+## 8. 段階的拡張の余地
+
+- IVF: `codes` の前段に k-means セル割当と転置リストを足す（距離カーネルは共通）。
+- PQ / RaBitQ: `quantize` に別エンコーダを追加、`codes` の意味を差し替え。
+- HNSW: グラフセクションを追加。
+- 並列化・mmap prefetch・SIMD の int8 経路（AVX2 `maddubs`）。
