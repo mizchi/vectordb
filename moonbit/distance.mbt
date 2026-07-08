@@ -45,6 +45,19 @@ pub fn dot_i8(
 ) -> Int {
   let mut acc = @v128.i32x4_splat(0U)
   let mut i = 0
+  // 16 int8 / iteration: load 16 bytes, widen low/high halves to i16x8, dot.
+  while i + 16 <= dim {
+    let va = @v128.v128_load(a, a_off + i)
+    let vb = @v128.v128_load(b, b_off + i)
+    let alo = @v128.i16x8_extend_low_i8x16_s(va)
+    let ahi = @v128.i16x8_extend_high_i8x16_s(va)
+    let blo = @v128.i16x8_extend_low_i8x16_s(vb)
+    let bhi = @v128.i16x8_extend_high_i8x16_s(vb)
+    acc = @v128.i32x4_add(acc, @v128.i32x4_dot_i16x8_s(alo, blo))
+    acc = @v128.i32x4_add(acc, @v128.i32x4_dot_i16x8_s(ahi, bhi))
+    i = i + 16
+  }
+  // tail: 8 int8 / iteration
   while i + 8 <= dim {
     let va = @v128.v128_load8x8_s(a, a_off + i)
     let vb = @v128.v128_load8x8_s(b, b_off + i)

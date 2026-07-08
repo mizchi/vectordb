@@ -84,7 +84,8 @@ moon run cmd/bench --release   # ベンチ（Rustと同条件, n=50k）
 | **wasm（v128 SIMD）** | 4.6 | 5.1 | **v128 が実効**（exact が wasm-gc スカラ比で約2倍速） |
 | llvm（nightly） | 9.2 | 36.7 | nightly で有効化できるが**遅く、v128 を実SIMD化しない**（exact が wasm の約7倍） |
 
-（数値は n=8000, nq=60 の参考値, ms/query）
+（数値は n=8000 での**チューニング前**の相対比較。どのバックエンドで v128 が実効するかを
+見るためのもの。チューニング後の絶対値は下の「Rust vs MoonBit」を参照）
 
 要点:
 - MoonBit で**ハードウェア SIMD を実際に使えるのは現状 `--target wasm` のみ**。
@@ -92,7 +93,26 @@ moon run cmd/bench --release   # ベンチ（Rustと同条件, n=50k）
   v128 を x86 SIMD へ落とさずスカラ実行する（llvm はむしろ最も遅い）。
 - 絶対速度が最速なのは native（tcc-run）だが v128 はスカラなので、SIMD を
   効かせる本プロジェクトでは既定を `wasm` にしている。
-- Rust(AVX2) は同条件で MoonBit のどのバックエンドより1桁以上速い。
+
+### Rust vs MoonBit(wasm) — チューニング後（50k×128, cosine, k=10, ms/query）
+
+| 方式 | Rust (AVX2) | MoonBit (wasm/v128) | 倍率 |
+|---|---|---|---|
+| int8 + rerank | 0.61 | **1.51** | 約 2.5x |
+| int8 only | 0.57 | 1.33 | 約 2.3x |
+| exact f32 | 1.06 | 2.78 | 約 2.6x |
+| recall@10 | 1.0 | 1.0 | 同 |
+
+（共有CPUのため絶対値は run ごとに変動。倍率は概ね 2〜3x で安定）
+
+チューニングで MoonBit(wasm) は初版の **約24ms → 1.5ms（約16倍高速化）**。当初 Rust比
+約40倍差だったのが **約2.4倍差**まで縮小した。効いた最適化:
+1. 全件ソート → **上限付き top-k ヒープ**（1クエリで N=5万件をソートしていたのを廃止。最大の効き）。
+2. int8 内積を **8→16要素/反復**（`v128_load` + `i16x8_extend_low/high` + `i32x4_dot_i16x8_s`）。
+3. スキャンループの構造体フィールドをローカルへ退避。
+
+残差（約2倍）は主に SIMD 幅の差（AVX2=256bit vs wasm v128=128bit）と wasm ランタイム
+（`moonrun`）のオーバーヘッド。
 
 nightly の導入と llvm の実行:
 

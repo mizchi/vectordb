@@ -31,6 +31,13 @@ fn main() {
     }
     let approx_dur = t.elapsed();
 
+    // int8-only scan (oversample = 1 skips the rerank stage).
+    let t = Instant::now();
+    for q in &qs {
+        std::hint::black_box(idx.search(q, k, 1));
+    }
+    let int8_dur = t.elapsed();
+
     // Exact ground truth.
     let t = Instant::now();
     let mut exact_results = Vec::with_capacity(queries);
@@ -55,6 +62,7 @@ fn main() {
 
     let per_query = |d: std::time::Duration| d.as_secs_f64() * 1e3 / queries as f64;
     println!("int8+rerank(o={oversample}): {:.3} ms/query", per_query(approx_dur));
+    println!("int8 only:                  {:.3} ms/query", per_query(int8_dur));
     println!("exact f32:                  {:.3} ms/query", per_query(exact_dur));
     println!("recall@{k}: {:.4}", recall);
     println!(

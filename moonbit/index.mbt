@@ -35,10 +35,110 @@ priv struct Cand {
   idx : Int
 }
 
+// ---------------------------------------------------------------------------
+// Bounded top-k: a fixed-capacity max-heap keyed on `key` (smaller = better).
+// Keeping only the best `cap` candidates avoids sorting the whole dataset on
+// every query, which dominated the earlier implementation.
+// ---------------------------------------------------------------------------
+
+///|
+priv struct TopK {
+  keys : FixedArray[Float]
+  idxs : FixedArray[Int]
+  mut size : Int
+  cap : Int
+}
+
+///|
+fn TopK::new(cap : Int) -> TopK {
+  let c = if cap < 1 { 1 } else { cap }
+  {
+    keys: FixedArray::make(c, (0.0 : Float)),
+    idxs: FixedArray::make(c, 0),
+    size: 0,
+    cap: c,
+  }
+}
+
+///|
+fn TopK::swap(self : TopK, a : Int, b : Int) -> Unit {
+  let tk = self.keys[a]
+  self.keys[a] = self.keys[b]
+  self.keys[b] = tk
+  let ti = self.idxs[a]
+  self.idxs[a] = self.idxs[b]
+  self.idxs[b] = ti
+}
+
+///|
+fn TopK::sift_down(self : TopK, start : Int) -> Unit {
+  let mut i = start
+  let n = self.size
+  while true {
+    let l = 2 * i + 1
+    let r = 2 * i + 2
+    let mut largest = i
+    if l < n && self.keys[l] > self.keys[largest] {
+      largest = l
+    }
+    if r < n && self.keys[r] > self.keys[largest] {
+      largest = r
+    }
+    if largest == i {
+      break
+    }
+    self.swap(i, largest)
+    i = largest
+  }
+}
+
+///|
+fn TopK::push(self : TopK, key : Float, idx : Int) -> Unit {
+  if self.size < self.cap {
+    let mut i = self.size
+    self.keys[i] = key
+    self.idxs[i] = idx
+    self.size = self.size + 1
+    while i > 0 {
+      let p = (i - 1) / 2
+      if self.keys[p] < self.keys[i] {
+        self.swap(p, i)
+        i = p
+      } else {
+        break
+      }
+    }
+  } else if key < self.keys[0] {
+    self.keys[0] = key
+    self.idxs[0] = idx
+    self.sift_down(0)
+  }
+}
+
+///|
+fn TopK::drain_sorted(self : TopK) -> Array[Cand] {
+  let out : Array[Cand] = []
+  for i in 0..<self.size {
+    out.push({ key: self.keys[i], idx: self.idxs[i] })
+  }
+  out.sort_by(fn(a, b) { cmp_float(a.key, b.key) })
+  out
+}
+
+// ---------------------------------------------------------------------------
+
 ///|
 fn is_cosine(m : Metric) -> Bool {
   match m {
     Cosine => true
+    _ => false
+  }
+}
+
+///|
+fn is_l2(m : Metric) -> Bool {
+  match m {
+    L2 => true
     _ => false
   }
 }
@@ -152,20 +252,6 @@ pub fn FlatIndex::has_raw(self : FlatIndex) -> Bool {
 }
 
 ///|
-/// Ranking key from an approximate int8 dot product (lower = better).
-fn FlatIndex::approx_key(
-  self : FlatIndex,
-  i : Int,
-  q_sqnorm : Float,
-  approx_dot : Float,
-) -> Float {
-  match self.metric {
-    L2 => self.sqnorms[i] + q_sqnorm - 2.0 * approx_dot
-    _ => -approx_dot
-  }
-}
-
-///|
 /// Search for the `k` nearest neighbors. When originals are kept and
 /// `oversample > 1`, the int8 scan feeds `k * oversample` candidates into an
 /// exact f32 rerank stage.
@@ -181,39 +267,52 @@ pub fn FlatIndex::search(
   if query.length() != self.dim {
     abort("FlatIndex::search: dimension mismatch")
   }
+  let dim = self.dim
+  let count = self.count
+  let l2 = is_l2(self.metric)
   let processed = if is_cosine(self.metric) { normalize(query) } else { query }
   let q = quantize(processed)
+  let qcodes = q.codes
+  let qscale = q.scale
+  let qsq = q.sqnorm
 
-  // Phase 1: approximate int8 scan.
-  let cands : Array[Cand] = []
-  for i in 0..<self.count {
-    let dp = dot_i8(self.codes, i * self.dim, q.codes, 0, self.dim)
-    let approx_dot = Float::from_double(dp.to_double()) * self.scales[i] * q.scale
-    cands.push({ key: self.approx_key(i, q.sqnorm, approx_dot), idx: i })
+  // Phase 1: approximate int8 scan into a bounded top-k.
+  let cand_n = match self.raw {
+    Some(_) =>
+      if oversample > 1 {
+        min(k * oversample, count)
+      } else {
+        min(k, count)
+      }
+    None => min(k, count)
   }
-  cands.sort_by(fn(a, b) { cmp_float(a.key, b.key) })
+  let top = TopK::new(cand_n)
+  let codes = self.codes
+  let scales = self.scales
+  let sqnorms = self.sqnorms
+  for i in 0..<count {
+    let dp = dot_i8(codes, i * dim, qcodes, 0, dim)
+    let approx_dot = Float::from_double(dp.to_double()) * scales[i] * qscale
+    let key = if l2 { sqnorms[i] + qsq - 2.0 * approx_dot } else { -approx_dot }
+    top.push(key, i)
+  }
 
   // Phase 2: rerank a widened candidate set with exact f32 distances.
-  let hits : Array[Hit] = []
   match self.raw {
     Some(rb) =>
       if oversample > 1 {
-        let cand_n = min(k * oversample, self.count)
         let qbytes = f32_array_to_bytes(processed)
-        let reranked : Array[Cand] = []
-        for c in 0..<cand_n {
-          let i = cands[c].idx
-          let key = exact_key(self.metric, rb, i, self.dim, qbytes)
-          reranked.push({ key, idx: i })
+        let rr = TopK::new(k)
+        for c in 0..<top.size {
+          let i = top.idxs[c]
+          rr.push(exact_key(self.metric, rb, i, dim, qbytes), i)
         }
-        reranked.sort_by(fn(a, b) { cmp_float(a.key, b.key) })
-        self.emit(reranked, k, hits)
+        self.emit(rr.drain_sorted(), k)
       } else {
-        self.emit(cands, k, hits)
+        self.emit(top.drain_sorted(), k)
       }
-    None => self.emit(cands, k, hits)
+    None => self.emit(top.drain_sorted(), k)
   }
-  hits
 }
 
 ///|
@@ -232,14 +331,11 @@ pub fn FlatIndex::search_exact(
   }
   let processed = if is_cosine(self.metric) { normalize(query) } else { query }
   let qbytes = f32_array_to_bytes(processed)
-  let cands : Array[Cand] = []
+  let top = TopK::new(min(k, self.count))
   for i in 0..<self.count {
-    cands.push({ key: exact_key(self.metric, rb, i, self.dim, qbytes), idx: i })
+    top.push(exact_key(self.metric, rb, i, self.dim, qbytes), i)
   }
-  cands.sort_by(fn(a, b) { cmp_float(a.key, b.key) })
-  let hits : Array[Hit] = []
-  self.emit(cands, k, hits)
-  hits
+  self.emit(top.drain_sorted(), k)
 }
 
 ///|
@@ -252,28 +348,26 @@ fn exact_key(
   qbytes : FixedArray[Byte],
 ) -> Float {
   let off = i * dim * 4
-  match metric {
-    L2 => l2sq_f32(raw, off, qbytes, 0, dim)
-    _ => -dot_f32(raw, off, qbytes, 0, dim)
+  if is_l2(metric) {
+    l2sq_f32(raw, off, qbytes, 0, dim)
+  } else {
+    -dot_f32(raw, off, qbytes, 0, dim)
   }
 }
 
 ///|
-/// Take the first `k` sorted candidates and append them as hits, converting the
-/// internal ranking key back into the reported metric score.
-fn FlatIndex::emit(
-  self : FlatIndex,
-  sorted : Array[Cand],
-  k : Int,
-  out : Array[Hit],
-) -> Unit {
+/// Take the first `k` sorted candidates as hits, converting the internal
+/// ranking key back into the reported metric score.
+fn FlatIndex::emit(self : FlatIndex, sorted : Array[Cand], k : Int) -> Array[Hit] {
   let hib = higher_is_better(self.metric)
   let n = min(k, sorted.length())
+  let out : Array[Hit] = []
   for c in 0..<n {
     let cand = sorted[c]
     let score = if hib { -cand.key } else { cand.key }
     out.push({ id: self.ids[cand.idx], score })
   }
+  out
 }
 
 ///|
