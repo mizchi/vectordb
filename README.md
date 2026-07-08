@@ -242,12 +242,18 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、`to
 `index.mbt`（Flat + rerank）/ `ivf.mbt`（IVF: k-means + nprobe）/
 `storage.mbt`（`.vecdb` 相互運用）。
 
-IVF は Rust 版と同設計:
+IVF は Rust 版と同設計、`.vecdb`（`VECDBIV1`）永続化も対応:
 
 ```moonbit
 let ivf = @vectordb.IvfIndex::build(vectors, ids, @vectordb.Cosine, 256, true, 12)
 let hits = ivf.search(query, 10, 4, 8)   // (k, nprobe, oversample)
+let bytes = ivf.to_bytes()
+let restored = @vectordb.IvfIndex::from_bytes(bytes)
 ```
+
+IVF 形式も Rust とバイト互換（k-means が決定的になる構成 nlist=count で Rust `save` と
+272 バイト一致を確認済み。通常構成では k-means が言語間で異なるためバイトは違うが、
+どちらが書いたファイルも相手が `from_bytes`/`load` で読める）。
 
 ## 段階的な拡張
 

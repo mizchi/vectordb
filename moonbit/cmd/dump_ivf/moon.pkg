@@ -1,0 +1,7 @@
+import {
+  "mizchi/vectordb",
+}
+
+options(
+  "is-main": true,
+)

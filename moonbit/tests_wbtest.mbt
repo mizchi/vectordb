@@ -252,3 +252,21 @@ test "ivf matches flat with full nprobe" {
   let b = flat.search(q, 1, 8)
   assert_eq(a[0].id, b[0].id)
 }
+
+///|
+test "ivf bytes round-trip" {
+  let (vectors, ids) = make_clusters()
+  let idx = IvfIndex::build(vectors, ids, L2, 4, true, 15)
+  let bytes = idx.to_bytes()
+  let back = IvfIndex::from_bytes(bytes)
+  assert_eq(back.length(), idx.length())
+  assert_eq(back.nlist(), idx.nlist())
+  assert_true(back.has_raw())
+  let q : Array[Float] = [10.0, 10.0]
+  let a = idx.search(q, 3, 2, 4)
+  let b = back.search(q, 3, 2, 4)
+  assert_eq(a.length(), b.length())
+  for i in 0..<a.length() {
+    assert_eq(a[i].id, b[i].id)
+  }
+}

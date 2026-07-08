@@ -354,3 +354,156 @@ fn ivf_finish(
   }
   out
 }
+
+// ---------------------------------------------------------------------------
+// Persistence: IVF `.vecdb` (magic "VECDBIV1"), byte-compatible with Rust.
+// Layout: 64B header + 16B-aligned sections:
+//   [header][ centroids f32 ][ offsets u64 ][ ids u64 ]
+//           [ scales f32 ][ sqnorms f32 ][ codes i8 ][ raw f32? ]
+// (k-means is not identical across languages, so byte-for-byte equality with
+//  Rust is not expected; the *format* is compatible — each can read the other.)
+// ---------------------------------------------------------------------------
+
+///|
+priv struct IvfLayout {
+  centroids : Int
+  offsets : Int
+  ids : Int
+  scales : Int
+  sqnorms : Int
+  codes : Int
+  raw : Int
+  total : Int
+}
+
+///|
+fn ivf_layout(dim : Int, count : Int, nlist : Int, has_raw : Bool) -> IvfLayout {
+  let centroids = align16(64)
+  let offsets = align16(centroids + nlist * dim * 4)
+  let ids = align16(offsets + (nlist + 1) * 8)
+  let scales = align16(ids + count * 8)
+  let sqnorms = align16(scales + count * 4)
+  let codes = align16(sqnorms + count * 4)
+  let raw = align16(codes + count * dim)
+  let total = if has_raw { align16(raw + count * dim * 4) } else { raw }
+  { centroids, offsets, ids, scales, sqnorms, codes, raw, total }
+}
+
+///|
+/// Serialize the IVF index to an IVF `.vecdb` byte buffer.
+pub fn IvfIndex::to_bytes(self : IvfIndex) -> FixedArray[Byte] {
+  let dim = self.dim
+  let count = self.count
+  let nlist = self.nlist
+  let has_raw = self.has_raw()
+  let l = ivf_layout(dim, count, nlist, has_raw)
+  let b : FixedArray[Byte] = FixedArray::make(l.total, 0)
+
+  let magic : FixedArray[Byte] = [0x56, 0x45, 0x43, 0x44, 0x42, 0x49, 0x56, 0x31]
+  for i in 0..<8 {
+    b[i] = magic[i]
+  }
+  write_u32_le(b, 8, 1)
+  write_u32_le(b, 12, metric_to_u32(self.metric))
+  write_u32_le(b, 16, dim.reinterpret_as_uint())
+  write_u32_le(b, 20, count.reinterpret_as_uint())
+  write_u32_le(b, 24, if has_raw { 1 } else { 0 })
+  write_u32_le(b, 28, nlist.reinterpret_as_uint())
+
+  for c in 0..<nlist {
+    let row = self.centroids[c]
+    for d in 0..<dim {
+      write_f32(b, l.centroids + (c * dim + d) * 4, row[d])
+    }
+  }
+  for i in 0..<(nlist + 1) {
+    write_u64_le(b, l.offsets + i * 8, self.offsets[i].to_int64().reinterpret_as_uint64())
+  }
+  for i in 0..<count {
+    write_u64_le(b, l.ids + i * 8, self.ids[i].reinterpret_as_uint64())
+    write_f32(b, l.scales + i * 4, self.scales[i])
+    write_f32(b, l.sqnorms + i * 4, self.sqnorms[i])
+  }
+  for j in 0..<(count * dim) {
+    b[l.codes + j] = self.codes[j]
+  }
+  match self.raw {
+    Some(rb) =>
+      for j in 0..<(count * dim * 4) {
+        b[l.raw + j] = rb[j]
+      }
+    None => ()
+  }
+  b
+}
+
+///|
+/// Parse an IVF `.vecdb` byte buffer into an [`IvfIndex`].
+pub fn IvfIndex::from_bytes(b : FixedArray[Byte]) -> IvfIndex {
+  if b.length() < 64 {
+    abort("IvfIndex::from_bytes: buffer smaller than header")
+  }
+  // magic "VECDBIV1"
+  if b[0] != 0x56 || b[5] != 0x49 || b[6] != 0x56 || b[7] != 0x31 {
+    abort("IvfIndex::from_bytes: bad magic")
+  }
+  if read_u32_le(b, 8) != 1 {
+    abort("IvfIndex::from_bytes: unsupported version")
+  }
+  let metric = metric_from_u32(read_u32_le(b, 12))
+  let dim = read_u32_le(b, 16).reinterpret_as_int()
+  let count = read_u32_le(b, 20).reinterpret_as_int()
+  let has_raw = read_u32_le(b, 24) != 0
+  let nlist = read_u32_le(b, 28).reinterpret_as_int()
+  let l = ivf_layout(dim, count, nlist, has_raw)
+  if b.length() < l.total {
+    abort("IvfIndex::from_bytes: buffer truncated")
+  }
+
+  let centroids : Array[Array[Float]] = []
+  for c in 0..<nlist {
+    let row = Array::make(dim, (0.0 : Float))
+    for d in 0..<dim {
+      row[d] = read_f32(b, l.centroids + (c * dim + d) * 4)
+    }
+    centroids.push(row)
+  }
+  let offsets = Array::make(nlist + 1, 0)
+  for i in 0..<(nlist + 1) {
+    offsets[i] = read_u64_le(b, l.offsets + i * 8).reinterpret_as_int64().to_int()
+  }
+  let ids = Array::make(count, (0 : Int64))
+  let scales = Array::make(count, (0.0 : Float))
+  let sqnorms = Array::make(count, (0.0 : Float))
+  for i in 0..<count {
+    ids[i] = read_u64_le(b, l.ids + i * 8).reinterpret_as_int64()
+    scales[i] = read_f32(b, l.scales + i * 4)
+    sqnorms[i] = read_f32(b, l.sqnorms + i * 4)
+  }
+  let codes : FixedArray[Byte] = FixedArray::make(count * dim, 0)
+  for j in 0..<(count * dim) {
+    codes[j] = b[l.codes + j]
+  }
+  let raw : FixedArray[Byte]? = if has_raw {
+    let rb : FixedArray[Byte] = FixedArray::make(count * dim * 4, 0)
+    for j in 0..<(count * dim * 4) {
+      rb[j] = b[l.raw + j]
+    }
+    Some(rb)
+  } else {
+    None
+  }
+  {
+    dim,
+    metric,
+    nlist,
+    count,
+    centroids,
+    offsets,
+    ids,
+    codes,
+    scales,
+    sqnorms,
+    raw,
+  }
+}
