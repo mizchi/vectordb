@@ -110,6 +110,8 @@ use vectordb::{HnswIndex, Metric};
 let mut idx = HnswIndex::new(dim, Metric::Cosine, /*m=*/16, /*ef_construction=*/200);
 idx.add(1, &embedding);
 let hits = idx.search(&query, 10, /*ef_search=*/64);
+idx.save("graph.hnsw.vecdb")?;              // グラフを永続化（magic VECDBHN1）
+let idx = HnswIndex::load("graph.hnsw.vecdb")?;
 ```
 
 ベンチ例（50k×128, cosine, 構築 ~8s）:

@@ -13,6 +13,8 @@ use crate::distance::{dot_f32, l2sq_f32};
 use crate::index::{Hit, Metric};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::io;
+use std::path::Path;
 
 /// A distance/node pair ordered by distance (smaller = closer). Used in the
 /// max-heap of current best results; wrap in `Reverse` for a nearest-first heap.
@@ -325,6 +327,160 @@ fn normalize(v: &[f32]) -> Vec<f32> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistence: an HNSW `.vecdb` file (magic "VECDBHN1").
+// Header (64B) + f32 vectors + u64 ids + u32 levels + variable-length links
+// (per node, per level: u32 len then len × u32 neighbor).
+// ---------------------------------------------------------------------------
+
+const HNSW_MAGIC: &[u8; 8] = b"VECDBHN1";
+const HNSW_VERSION: u32 = 1;
+
+#[inline]
+fn align16(x: usize) -> usize {
+    (x + 15) & !15
+}
+
+impl HnswIndex {
+    /// Serialize the graph to an HNSW `.vecdb` file.
+    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let dim = self.dim;
+        let count = self.len();
+        let mut links_bytes = 0usize;
+        for i in 0..count {
+            for lc in 0..=self.levels[i] {
+                links_bytes += 4 + self.links[i][lc].len() * 4;
+            }
+        }
+        let vec_off = align16(64);
+        let ids_off = align16(vec_off + count * dim * 4);
+        let lvl_off = align16(ids_off + count * 8);
+        let links_off = align16(lvl_off + count * 4);
+        let total = links_off + links_bytes;
+
+        let mut b = vec![0u8; total];
+        b[0..8].copy_from_slice(HNSW_MAGIC);
+        b[8..12].copy_from_slice(&HNSW_VERSION.to_le_bytes());
+        b[12..16].copy_from_slice(&(self.metric as u32).to_le_bytes());
+        b[16..20].copy_from_slice(&(dim as u32).to_le_bytes());
+        b[20..24].copy_from_slice(&(count as u32).to_le_bytes());
+        b[24..28].copy_from_slice(&(self.m as u32).to_le_bytes());
+        b[28..32].copy_from_slice(&(self.ef_construction as u32).to_le_bytes());
+        b[32..36].copy_from_slice(&(self.max_level as u32).to_le_bytes());
+        b[36..40].copy_from_slice(&(self.entry.unwrap_or(0)).to_le_bytes());
+        b[40..48].copy_from_slice(&self.rng.to_le_bytes());
+
+        for (j, &x) in self.vectors.iter().enumerate() {
+            b[vec_off + j * 4..vec_off + j * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+        for (i, &id) in self.ids.iter().enumerate() {
+            b[ids_off + i * 8..ids_off + i * 8 + 8].copy_from_slice(&id.to_le_bytes());
+        }
+        for (i, &lv) in self.levels.iter().enumerate() {
+            b[lvl_off + i * 4..lvl_off + i * 4 + 4].copy_from_slice(&(lv as u32).to_le_bytes());
+        }
+        let mut p = links_off;
+        for i in 0..count {
+            for lc in 0..=self.levels[i] {
+                let nbrs = &self.links[i][lc];
+                b[p..p + 4].copy_from_slice(&(nbrs.len() as u32).to_le_bytes());
+                p += 4;
+                for &nb in nbrs {
+                    b[p..p + 4].copy_from_slice(&nb.to_le_bytes());
+                    p += 4;
+                }
+            }
+        }
+        std::fs::write(path, &b)
+    }
+
+    /// Load an HNSW `.vecdb` file.
+    pub fn load(path: impl AsRef<Path>) -> io::Result<HnswIndex> {
+        let b = std::fs::read(path)?;
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("hnsw: {m}"));
+        if b.len() < 64 || &b[0..8] != HNSW_MAGIC {
+            return Err(bad("bad magic"));
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        if u32_at(8) != HNSW_VERSION {
+            return Err(bad("unsupported version"));
+        }
+        let metric = Metric::from_u32(u32_at(12)).ok_or_else(|| bad("bad metric"))?;
+        let dim = u32_at(16) as usize;
+        let count = u32_at(20) as usize;
+        let m = u32_at(24) as usize;
+        let ef_construction = u32_at(28) as usize;
+        let max_level = u32_at(32) as usize;
+        let entry_raw = u32_at(36);
+        let mut rng = [0u8; 8];
+        rng.copy_from_slice(&b[40..48]);
+        let rng = u64::from_le_bytes(rng);
+
+        let vec_off = align16(64);
+        let ids_off = align16(vec_off + count * dim * 4);
+        let lvl_off = align16(ids_off + count * 8);
+        let links_off = align16(lvl_off + count * 4);
+        if b.len() < links_off {
+            return Err(bad("file truncated"));
+        }
+
+        let vectors: Vec<f32> = (0..count * dim)
+            .map(|j| {
+                let o = vec_off + j * 4;
+                f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+            })
+            .collect();
+        let ids: Vec<u64> = (0..count)
+            .map(|i| {
+                let o = ids_off + i * 8;
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b[o..o + 8]);
+                u64::from_le_bytes(a)
+            })
+            .collect();
+        let levels: Vec<usize> = (0..count).map(|i| u32_at(lvl_off + i * 4) as usize).collect();
+
+        let mut links: Vec<Vec<Vec<u32>>> = Vec::with_capacity(count);
+        let mut p = links_off;
+        for &lv in levels.iter() {
+            let mut node_links = Vec::with_capacity(lv + 1);
+            for _ in 0..=lv {
+                if p + 4 > b.len() {
+                    return Err(bad("links truncated"));
+                }
+                let len = u32_at(p) as usize;
+                p += 4;
+                let mut lst = Vec::with_capacity(len);
+                for _ in 0..len {
+                    if p + 4 > b.len() {
+                        return Err(bad("links truncated"));
+                    }
+                    lst.push(u32_at(p));
+                    p += 4;
+                }
+                node_links.push(lst);
+            }
+            links.push(node_links);
+        }
+
+        Ok(HnswIndex {
+            dim,
+            metric,
+            m,
+            m0: m * 2,
+            ef_construction,
+            ml: 1.0 / (m as f64).ln(),
+            vectors,
+            ids,
+            links,
+            levels,
+            entry: if count > 0 { Some(entry_raw) } else { None },
+            max_level,
+            rng,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +549,24 @@ mod tests {
         }
         let recall = hit as f64 / total as f64;
         assert!(recall >= 0.90, "filtered recall too low: {recall}");
+    }
+
+    #[test]
+    fn hnsw_save_load_roundtrip() {
+        let (idx, items) = build(Metric::L2);
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_hnsw_test.vecdb");
+        idx.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        // Same queries return the same results after a save/load round-trip.
+        for t in 0..20 {
+            let q = &items[t * 41 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 64).iter().map(|h| h.id).collect();
+            let b: Vec<u64> = loaded.search(q, 10, 64).iter().map(|h| h.id).collect();
+            assert_eq!(a, b);
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
