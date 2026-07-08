@@ -398,6 +398,14 @@ impl FlatIndex {
         removed
     }
 
+    /// Insert or replace: tombstone any existing rows with `id`, then append
+    /// the new vector. Tombstones accumulate across upserts — call
+    /// [`compact`](Self::compact) periodically to reclaim space.
+    pub fn upsert(&mut self, id: u64, vector: &[f32]) {
+        self.remove(id);
+        self.add(id, vector);
+    }
+
     /// Physically drop tombstoned rows, compacting the backing storage.
     pub fn compact(&mut self) {
         if self.deleted_count == 0 {
@@ -601,6 +609,24 @@ mod tests {
         assert_eq!(batch.len(), 3);
         let batch0: Vec<u64> = batch[0].iter().map(|h| h.id).collect();
         assert_eq!(batch0, serial);
+    }
+
+    #[test]
+    fn upsert_replaces_vector() {
+        let mut idx = FlatIndex::new(4, Metric::Cosine, true);
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]);
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]);
+        // Move id 1 to point along the y axis.
+        idx.upsert(1, &[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(idx.live_len(), 2);
+        // Query along y: both id 1 (moved) and id 2 are top; querying x should
+        // no longer return id 1 first.
+        let hy = idx.search(&[0.0, 1.0, 0.0, 0.0], 2, 4);
+        assert!(hy.iter().any(|h| h.id == 1));
+        let hx = idx.search(&[1.0, 0.0, 0.0, 0.0], 1, 4);
+        assert_ne!(hx[0].id, 1); // id 1 no longer near the x axis
+        idx.compact();
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]
