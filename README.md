@@ -66,9 +66,17 @@ fallback を持つため、`native` / `wasm` / `wasm-gc` / `js` すべてで動�
 
 ```bash
 cd moonbit
-moon test --target native   # 8 tests（距離・量子化・検索・recall）
-moon run cmd/main --target native   # デモ
+moon test --target native            # 8 tests（距離・量子化・検索・recall）
+moon run cmd/main  --target native   # デモ
+moon run cmd/bench --target native --release   # ベンチ（Rustと同条件）
+# SIMD の効き比較: --target wasm（v128有効） vs --target wasm-gc（スカラ）
 ```
+
+速度メモ（50k×128, cosine, 参考値）:
+- 現状 Rust(AVX2) が MoonBit(native) より約1桁速い。
+- `wasm` ターゲットでは f32 距離が `wasm-gc`(スカラ)比で約2倍速く、v128 SIMD が
+  効いていることを確認済み。一方 **native バックエンドは現状 v128 を実SIMD命令へ
+  落とさずスカラ相当**（int8 と exact がほぼ同速）。
 
 API:
 

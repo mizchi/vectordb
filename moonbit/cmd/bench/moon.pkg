@@ -1,0 +1,8 @@
+import {
+  "mizchi/vectordb",
+  "moonbitlang/core/bench" @perf,
+}
+
+options(
+  "is-main": true,
+)
