@@ -3,7 +3,7 @@
 //! Run with: `cargo run --release --example bench`
 
 use std::time::Instant;
-use vectordb::{BinaryIndex, FlatIndex, IvfIndex, Metric};
+use vectordb::{BinaryIndex, FlatIndex, IvfIndex, Metric, RabitqIndex};
 
 fn main() {
     let n = 50_000usize;
@@ -172,6 +172,22 @@ fn main() {
         n * dim / 1024,
         n * dim * 4 / 1024
     );
+
+    // ---- RaBitQ (1-bit + unbiased estimator) vs plain binary ----
+    let rq = RabitqIndex::build(dim, Metric::Cosine, &items, true, 0x5EED);
+    println!("--- RaBitQ vs binary (both 1-bit codes, recall@{k}) ---");
+    for &o in &[1usize, 4, 16] {
+        let t = Instant::now();
+        let rq_res: Vec<Vec<vectordb::Hit>> = qs.iter().map(|q| rq.search(q, k, o)).collect();
+        let rq_dur = t.elapsed();
+        let bin_res: Vec<Vec<vectordb::Hit>> = qs.iter().map(|q| bin.search(q, k, o)).collect();
+        println!(
+            "oversample={o:<3} RaBitQ recall={:.4} ({:.3} ms)   binary recall={:.4}",
+            recall_of(&rq_res),
+            per_query(rq_dur),
+            recall_of(&bin_res)
+        );
+    }
 }
 
 /// Tiny deterministic xorshift RNG (no external deps).

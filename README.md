@@ -112,8 +112,24 @@ let hits = bin.search(&query, 10, /*oversample=*/16);
 ベンチ例（50k×128, クラスタ構造）: `binary+rerank(o=16)` ≈ 0.46 ms/query, recall@10≈0.90,
 コード 781 KiB（int8 6.25 MiB / f32 25 MiB）。oversample を上げると recall 向上。
 
-> RaBitQ（SIGMOD'24/'25）は符号ビットの精度改良版（ランダム回転 + 誤差限界つき推定量）。
-> 同じパックビット格納の上に `encode`/`estimate` を差し替える形で追加できる（今後）。
+### RaBitQ（1-bit + 不偏推定量）, `rabitq.rs`
+
+RaBitQ（Gao & Long, SIGMOD 2024）: 重心を引いて**ランダム回転**をかけ、符号ビット
+（1 bit/dim）+ 補正係数で内積を**誤差限界つき不偏推定**する。DB は 1-bit のまま、
+クエリはビットプレーン量子化（`QUERY_BITS=4`）して**popcount で推定**するため、素の
+符号×f32（40ms）から **約22x 高速（~1.8ms/query）** になっている。
+
+```rust
+use vectordb::{RabitqIndex, Metric};
+let rq = RabitqIndex::build(dim, Metric::Cosine, &items, /*keep_raw=*/true, /*seed=*/1);
+let hits = rq.search(&query, 10, /*oversample=*/16);
+```
+
+注意（正直な結果）: **グローバル重心の Flat 構成**では、タイトなクラスタ内で符号が
+同一化しやすく、精度は素の sign-binary と同程度（本ベンチ 50k で o=16: RaBitQ 0.905 /
+binary 0.900）。RaBitQ の精度優位は **IVF のセル毎重心と組む（IVF+RaBitQ）** ときに
+顕著になる — これが論文の標準構成で、次の自然な統合先。誤差限界つき推定量と高速
+popcount スキャンはこのモジュールで実装済み。
 
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
@@ -121,6 +137,7 @@ let hits = bin.search(&query, 10, /*oversample=*/16);
 - `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
 - `ivf.rs` — IVF（k-means + nprobe 探索）+ save/load + 並列
 - `bin_quant.rs` — binary(1-bit) 量子化 + ハミング + rerank
+- `rabitq.rs` — RaBitQ(1-bit + 回転 + 不偏推定量, ビットプレーン popcount)
 - `storage.rs` — `.vecdb` の save / mmap open / load
 
 ## MoonBit（試作）
