@@ -28,6 +28,6 @@ pub mod storage;
 pub use bin_quant::BinaryIndex;
 pub use index::{FlatIndex, Hit, Metric, View};
 pub use ivf::IvfIndex;
-pub use rabitq::RabitqIndex;
+pub use rabitq::{IvfRabitqIndex, RabitqIndex};
 pub use quantize::{quantize, Quantized};
 pub use storage::{load, open, save, MmapIndex};

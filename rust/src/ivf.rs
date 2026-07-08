@@ -493,7 +493,7 @@ fn normalize(v: &[f32]) -> Vec<f32> {
 
 /// Lloyd's k-means over row-major `data` (`n * dim`). Returns
 /// `(centroids [nlist*dim], assignment [n])`.
-fn kmeans(
+pub(crate) fn kmeans(
     data: &[f32],
     n: usize,
     dim: usize,

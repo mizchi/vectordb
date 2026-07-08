@@ -128,8 +128,29 @@ let hits = rq.search(&query, 10, /*oversample=*/16);
 注意（正直な結果）: **グローバル重心の Flat 構成**では、タイトなクラスタ内で符号が
 同一化しやすく、精度は素の sign-binary と同程度（本ベンチ 50k で o=16: RaBitQ 0.905 /
 binary 0.900）。RaBitQ の精度優位は **IVF のセル毎重心と組む（IVF+RaBitQ）** ときに
-顕著になる — これが論文の標準構成で、次の自然な統合先。誤差限界つき推定量と高速
-popcount スキャンはこのモジュールで実装済み。
+顕著になる（下記）。
+
+### IVF + RaBitQ（`rabitq.rs` の `IvfRabitqIndex`）
+
+k-means の**セル毎重心**で残差を小さく分散させると、RaBitQ 推定量が精度を発揮する
+（論文の標準構成）。DB は 1-bit/dim のまま。
+
+```rust
+use vectordb::{IvfRabitqIndex, Metric};
+let idx = IvfRabitqIndex::build(dim, Metric::Cosine, 256, &items, true, 12, /*seed=*/1);
+let hits = idx.search(&query, 10, /*nprobe=*/16, /*oversample=*/32);
+```
+
+ベンチ例（50k×128, クラスタ, nprobe=16, **1-bit コード 781 KiB = int8 の 1/8**）:
+
+| oversample | ms/query | recall@10 |
+|---|---|---|
+| 8 | 0.56 | 0.88 |
+| 16 | 0.58 | 0.986 |
+| 32 | 0.62 | **1.0000** |
+
+1-bit 推定量は int8 より粗いので recall は rerank 候補数（oversample）で決まる。
+oversample を上げると **int8 の 1/8 のメモリで recall 1.0** に到達する。
 
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
@@ -137,7 +158,7 @@ popcount スキャンはこのモジュールで実装済み。
 - `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
 - `ivf.rs` — IVF（k-means + nprobe 探索）+ save/load + 並列
 - `bin_quant.rs` — binary(1-bit) 量子化 + ハミング + rerank
-- `rabitq.rs` — RaBitQ(1-bit + 回転 + 不偏推定量, ビットプレーン popcount)
+- `rabitq.rs` — RaBitQ(1-bit + 回転 + 不偏推定量) + IVF+RaBitQ
 - `storage.rs` — `.vecdb` の save / mmap open / load
 
 ## MoonBit（試作）

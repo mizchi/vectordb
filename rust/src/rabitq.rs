@@ -299,6 +299,258 @@ impl QuantizedQuery {
     }
 }
 
+/// IVF + RaBitQ: per-cell centroids make the residuals small and well spread,
+/// which is where RaBitQ's estimator becomes accurate. This is the canonical
+/// high-recall / low-memory configuration.
+pub struct IvfRabitqIndex {
+    dim: usize,
+    metric: Metric,
+    nlist: usize,
+    words: usize,
+    rot: Vec<f32>,        // dim * dim rotation
+    centroids: Vec<f32>,  // nlist * dim
+    cc: Vec<f32>,         // <c, c> per cell
+    offsets: Vec<usize>,  // nlist + 1
+    ids: Vec<u64>,
+    signs: Vec<u64>,      // count * words
+    popcnt: Vec<u32>,
+    res_sq: Vec<f32>,     // ||v - c_cell||^2
+    coef: Vec<f32>,       // ||r||^2 / sum|r_i|
+    oc: Vec<f32>,         // <v, c_cell>
+    raw: Option<Vec<f32>>,
+}
+
+impl IvfRabitqIndex {
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+    pub fn nlist(&self) -> usize {
+        self.nlist
+    }
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+    pub fn has_raw(&self) -> bool {
+        self.raw.is_some()
+    }
+    pub fn code_bytes(&self) -> usize {
+        self.signs.len() * 8
+    }
+
+    /// Build an IVF+RaBitQ index. `nlist == 0` → ~sqrt(n) cells.
+    pub fn build(
+        dim: usize,
+        metric: Metric,
+        nlist: usize,
+        items: &[(u64, Vec<f32>)],
+        keep_raw: bool,
+        kmeans_iters: usize,
+        seed: u64,
+    ) -> Self {
+        assert!(dim > 0);
+        let n = items.len();
+        assert!(n > 0, "cannot build an empty index");
+        let nlist = if nlist == 0 {
+            ((n as f64).sqrt() as usize).clamp(1, n)
+        } else {
+            nlist.min(n)
+        };
+        let cosine = metric == Metric::Cosine;
+        let words = dim.div_ceil(64);
+
+        // Processed vectors, flattened.
+        let mut proc = vec![0f32; n * dim];
+        for (i, (_, v)) in items.iter().enumerate() {
+            assert_eq!(v.len(), dim, "dimension mismatch");
+            if cosine {
+                proc[i * dim..(i + 1) * dim].copy_from_slice(&normalize(v));
+            } else {
+                proc[i * dim..(i + 1) * dim].copy_from_slice(v);
+            }
+        }
+
+        let (centroids, assign) = crate::ivf::kmeans(&proc, n, dim, nlist, kmeans_iters, cosine);
+        let mut cc = vec![0f32; nlist];
+        for c in 0..nlist {
+            let cen = &centroids[c * dim..(c + 1) * dim];
+            cc[c] = dot(cen, cen);
+        }
+
+        // CSR grouping by cell.
+        let mut counts = vec![0usize; nlist];
+        for &c in &assign {
+            counts[c] += 1;
+        }
+        let mut offsets = vec![0usize; nlist + 1];
+        for c in 0..nlist {
+            offsets[c + 1] = offsets[c] + counts[c];
+        }
+        let mut cursor = offsets.clone();
+
+        let rot = random_rotation(dim, seed);
+        let mut ids = vec![0u64; n];
+        let mut signs = vec![0u64; n * words];
+        let mut popcnt = vec![0u32; n];
+        let mut res_sq = vec![0f32; n];
+        let mut coef = vec![0f32; n];
+        let mut oc = vec![0f32; n];
+        let mut raw = if keep_raw {
+            Some(vec![0f32; n * dim])
+        } else {
+            None
+        };
+
+        let mut d = vec![0f32; dim];
+        let mut r = vec![0f32; dim];
+        for (i, (id, _)) in items.iter().enumerate() {
+            let cell = assign[i];
+            let dst = cursor[cell];
+            cursor[cell] += 1;
+            let v = &proc[i * dim..(i + 1) * dim];
+            let cen = &centroids[cell * dim..(cell + 1) * dim];
+            for j in 0..dim {
+                d[j] = v[j] - cen[j];
+            }
+            matvec(&rot, &d, &mut r, dim);
+            let rsq = dot(&r, &r);
+            let mut sum_abs = 0f32;
+            let mut pc = 0u32;
+            for (j, &rj) in r.iter().enumerate() {
+                sum_abs += rj.abs();
+                if rj >= 0.0 {
+                    signs[dst * words + j / 64] |= 1u64 << (j % 64);
+                    pc += 1;
+                }
+            }
+            popcnt[dst] = pc;
+            res_sq[dst] = rsq;
+            coef[dst] = if sum_abs > 0.0 { rsq / sum_abs } else { 0.0 };
+            oc[dst] = dot(v, cen);
+            ids[dst] = *id;
+            if let Some(rw) = raw.as_mut() {
+                rw[dst * dim..(dst + 1) * dim].copy_from_slice(v);
+            }
+        }
+
+        IvfRabitqIndex {
+            dim,
+            metric,
+            nlist,
+            words,
+            rot,
+            centroids,
+            cc,
+            offsets,
+            ids,
+            signs,
+            popcnt,
+            res_sq,
+            coef,
+            oc,
+            raw,
+        }
+    }
+
+    /// Search the `nprobe` nearest cells with the RaBitQ estimator, then rerank.
+    pub fn search(&self, query: &[f32], k: usize, nprobe: usize, oversample: usize) -> Vec<Hit> {
+        if k == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        assert_eq!(query.len(), self.dim, "dimension mismatch");
+        let processed = if self.metric == Metric::Cosine {
+            normalize(query)
+        } else {
+            query.to_vec()
+        };
+        let nprobe = nprobe.clamp(1, self.nlist);
+        let l2 = self.metric == Metric::L2;
+
+        // Pick the nprobe nearest cells.
+        let mut cell_heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(nprobe + 1);
+        for c in 0..self.nlist {
+            let cen = &self.centroids[c * self.dim..(c + 1) * self.dim];
+            let key = if l2 {
+                l2sq_f32(cen, &processed)
+            } else {
+                -dot_f32(cen, &processed)
+            };
+            push_bounded(&mut cell_heap, Ranked { key, idx: c }, nprobe);
+        }
+        let cells: Vec<usize> = cell_heap.into_iter().map(|r| r.idx).collect();
+
+        let cand_n = if self.raw.is_some() {
+            (k * oversample.max(1)).min(self.len())
+        } else {
+            k.min(self.len())
+        };
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
+        let mut qd = vec![0f32; self.dim];
+        let mut qr = vec![0f32; self.dim];
+        for &c in &cells {
+            let cen = &self.centroids[c * self.dim..(c + 1) * self.dim];
+            for j in 0..self.dim {
+                qd[j] = processed[j] - cen[j];
+            }
+            matvec(&self.rot, &qd, &mut qr, self.dim);
+            let qr_sq = dot(&qd, &qd);
+            let qc = dot(&processed, cen);
+            let qq = QuantizedQuery::new(&qr, self.words, self.dim);
+            for i in self.offsets[c]..self.offsets[c + 1] {
+                let s = qq.estimate_sign_dot(
+                    &self.signs[i * self.words..(i + 1) * self.words],
+                    self.popcnt[i],
+                );
+                let ip_c = self.coef[i] * s;
+                let key = if l2 {
+                    self.res_sq[i] + qr_sq - 2.0 * ip_c
+                } else {
+                    -(ip_c + self.oc[i] + qc - self.cc[c])
+                };
+                push_bounded(&mut heap, Ranked { key, idx: i }, cand_n);
+            }
+        }
+
+        if self.raw.is_some() && oversample > 1 {
+            let mut rr: BinaryHeap<Ranked> = BinaryHeap::with_capacity(k + 1);
+            for Ranked { idx, .. } in heap.into_iter() {
+                let key = self.exact_key(idx, &processed);
+                push_bounded(&mut rr, Ranked { key, idx }, k);
+            }
+            self.finish(rr)
+        } else {
+            self.finish(heap)
+        }
+    }
+
+    #[inline]
+    fn exact_key(&self, i: usize, processed_query: &[f32]) -> f32 {
+        let v = &self.raw.as_ref().expect("raw not kept")[i * self.dim..(i + 1) * self.dim];
+        match self.metric {
+            Metric::L2 => l2sq_f32(v, processed_query),
+            Metric::Dot | Metric::Cosine => -dot_f32(v, processed_query),
+        }
+    }
+
+    fn finish(&self, heap: BinaryHeap<Ranked>) -> Vec<Hit> {
+        let mut items: Vec<Ranked> = heap.into_vec();
+        items.sort_by(|a, b| a.key.total_cmp(&b.key));
+        let hib = self.metric.higher_is_better();
+        items
+            .into_iter()
+            .map(|Ranked { key, idx }| Hit {
+                id: self.ids[idx],
+                score: if hib { -key } else { key },
+            })
+            .collect()
+    }
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -451,6 +703,54 @@ mod tests {
         }
         let recall = hit as f64 / probes as f64;
         assert!(recall >= 0.8, "estimator near-identity recall too low: {recall}");
+    }
+
+    #[test]
+    fn ivf_rabitq_beats_flat_rabitq_estimator() {
+        // Per-cell centroids should give the estimator a clear edge over a
+        // single global centroid on clustered data (no rerank, oversample=1).
+        let dim = 64;
+        let (items, centers) = clustered(dim, 4000, 40);
+        let flat = RabitqIndex::build(dim, Metric::Cosine, &items, false, 7);
+        let ivf = IvfRabitqIndex::build(dim, Metric::Cosine, 40, &items, false, 12, 7);
+        let mut truth_idx = crate::FlatIndex::new(dim, Metric::Cosine, true);
+        for (id, v) in &items {
+            truth_idx.add(*id, v);
+        }
+        let (mut flat_hit, mut ivf_hit, mut total) = (0, 0, 0);
+        for t in 0..40 {
+            let c = &centers[t % centers.len()];
+            let q: Vec<f32> = c.iter().map(|x| x + 0.03).collect();
+            let truth: std::collections::HashSet<u64> =
+                truth_idx.search_exact(&q, 10).iter().map(|h| h.id).collect();
+            flat_hit += flat.search(&q, 10, 1).iter().filter(|h| truth.contains(&h.id)).count();
+            ivf_hit += ivf.search(&q, 10, 8, 1).iter().filter(|h| truth.contains(&h.id)).count();
+            total += truth.len();
+        }
+        let (fr, ir) = (flat_hit as f64 / total as f64, ivf_hit as f64 / total as f64);
+        assert!(ir >= fr, "IVF+RaBitQ {ir} should beat flat RaBitQ {fr}");
+    }
+
+    #[test]
+    fn ivf_rabitq_high_recall_with_rerank() {
+        let dim = 64;
+        let (items, centers) = clustered(dim, 4000, 40);
+        let ivf = IvfRabitqIndex::build(dim, Metric::Cosine, 40, &items, true, 12, 1);
+        let mut truth_idx = crate::FlatIndex::new(dim, Metric::Cosine, true);
+        for (id, v) in &items {
+            truth_idx.add(*id, v);
+        }
+        let (mut hit, mut total) = (0, 0);
+        for t in 0..40 {
+            let c = &centers[t % centers.len()];
+            let q: Vec<f32> = c.iter().map(|x| x + 0.01).collect();
+            let truth: std::collections::HashSet<u64> =
+                truth_idx.search_exact(&q, 10).iter().map(|h| h.id).collect();
+            hit += ivf.search(&q, 10, 8, 16).iter().filter(|h| truth.contains(&h.id)).count();
+            total += truth.len();
+        }
+        let recall = hit as f64 / total as f64;
+        assert!(recall >= 0.95, "recall too low: {recall}");
     }
 
     #[test]

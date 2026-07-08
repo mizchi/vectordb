@@ -3,7 +3,7 @@
 //! Run with: `cargo run --release --example bench`
 
 use std::time::Instant;
-use vectordb::{BinaryIndex, FlatIndex, IvfIndex, Metric, RabitqIndex};
+use vectordb::{BinaryIndex, FlatIndex, IvfIndex, IvfRabitqIndex, Metric, RabitqIndex};
 
 fn main() {
     let n = 50_000usize;
@@ -186,6 +186,26 @@ fn main() {
             recall_of(&rq_res),
             per_query(rq_dur),
             recall_of(&bin_res)
+        );
+    }
+
+    // ---- IVF + RaBitQ: per-cell centroids, 1-bit codes ----
+    let ivfrq = IvfRabitqIndex::build(dim, Metric::Cosine, nlist, &items, true, 12, 0xF00D);
+    println!(
+        "--- IVF+RaBitQ (nlist={nlist}, 1-bit codes {} KiB) ---",
+        ivfrq.code_bytes() / 1024
+    );
+    // recall is bounded by the rerank candidate count (oversample), not nprobe
+    // here, since 1-bit estimates are coarser than int8 — sweep oversample.
+    for &o in &[8usize, 16, 32, 64] {
+        let t = Instant::now();
+        let res: Vec<Vec<vectordb::Hit>> =
+            qs.iter().map(|q| ivfrq.search(q, k, 16, o)).collect();
+        let dur = t.elapsed();
+        println!(
+            "nprobe=16 oversample={o:<3} {:.3} ms/query  recall@{k}={:.4}",
+            per_query(dur),
+            recall_of(&res)
         );
     }
 }
