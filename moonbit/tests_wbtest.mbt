@@ -207,3 +207,48 @@ test "vecdb bytes round-trip (compact, no raw)" {
   let hits = back.search([0.9, 0.1, 0.0, 0.0], 1, 1)
   assert_eq(hits[0].id, 7L)
 }
+
+///|
+fn make_clusters() -> (Array[Array[Float]], Array[Int64]) {
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  let centers : Array[Array[Float]] = [
+    [0.0, 0.0],
+    [10.0, 0.0],
+    [0.0, 10.0],
+    [10.0, 10.0],
+  ]
+  let mut id = 0L
+  for ci in 0..<4 {
+    for j in 0..<25 {
+      let jit = Float::from_double(j.to_double()) * 0.01
+      vectors.push([centers[ci][0] + jit, centers[ci][1] - jit])
+      ids.push(id)
+      id = id + 1L
+    }
+  }
+  (vectors, ids)
+}
+
+///|
+test "ivf finds local cluster (l2)" {
+  let (vectors, ids) = make_clusters()
+  let idx = IvfIndex::build(vectors, ids, L2, 4, true, 15)
+  assert_eq(idx.length(), 100)
+  let hits = idx.search([10.0, 10.0], 3, 2, 4)
+  assert_eq(hits.length(), 3)
+  for h in hits {
+    assert_true(h.id >= 75L) // 4th cluster is ids 75..99
+  }
+}
+
+///|
+test "ivf matches flat with full nprobe" {
+  let (vectors, ids) = make_clusters()
+  let ivf = IvfIndex::build(vectors, ids, L2, 4, true, 20)
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let q : Array[Float] = [7.0, 9.0]
+  let a = ivf.search(q, 1, 4, 8) // nprobe = nlist => scans all
+  let b = flat.search(q, 1, 8)
+  assert_eq(a[0].id, b[0].id)
+}

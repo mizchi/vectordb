@@ -222,7 +222,15 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、`to
 バイト列を扱う（ファイル入出力はホスト側が担当）。
 
 構成: `distance.mbt`（SIMD 距離）/ `quantize.mbt`（int8 量子化）/
-`index.mbt`（Flat + rerank）。
+`index.mbt`（Flat + rerank）/ `ivf.mbt`（IVF: k-means + nprobe）/
+`storage.mbt`（`.vecdb` 相互運用）。
+
+IVF は Rust 版と同設計:
+
+```moonbit
+let ivf = @vectordb.IvfIndex::build(vectors, ids, @vectordb.Cosine, 256, true, 12)
+let hits = ivf.search(query, 10, 4, 8)   // (k, nprobe, oversample)
+```
 
 ## 段階的な拡張
 
