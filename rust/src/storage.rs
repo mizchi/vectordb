@@ -58,6 +58,10 @@ fn layout(dim: usize, count: usize, has_raw: bool) -> Layout {
 }
 
 /// Serialize an index to a `.vecdb` file.
+///
+/// Tombstoned rows are in-memory only; call [`FlatIndex::compact`] before
+/// saving to persist deletions (otherwise all rows, including tombstoned ones,
+/// are written and would come back live on load).
 pub fn save(index: &FlatIndex, path: impl AsRef<Path>) -> io::Result<()> {
     let dim = index.dim();
     let count = index.len();
@@ -149,6 +153,7 @@ impl MmapIndex {
                 raw: self
                     .raw
                     .map(|p| std::slice::from_raw_parts(p, self.count * self.dim)),
+                deleted: None,
             }
         }
     }
@@ -248,6 +253,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<FlatIndex> {
     if let Some(raw) = v.raw {
         idx.raw.as_mut().unwrap().extend_from_slice(raw);
     }
+    idx.deleted = vec![false; idx.ids.len()];
     Ok(idx)
 }
 

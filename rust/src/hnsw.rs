@@ -143,7 +143,7 @@ impl HnswIndex {
         // Insert into layers min(level, top) .. 0.
         let start = level.min(top);
         for lc in (0..=start).rev() {
-            let mut w = self.search_layer(&processed, &[ep], self.ef_construction, lc);
+            let mut w = self.search_layer(&processed, &[ep], self.ef_construction, lc, &|_| true);
             // Entry point for the next layer down = nearest found.
             if let Some(best) = w.iter().min_by(|a, b| a.dist.total_cmp(&b.dist)) {
                 ep = best.node;
@@ -185,7 +185,17 @@ impl HnswIndex {
     }
 
     /// Beam search within one layer; returns up to `ef` nearest as a vec.
-    fn search_layer(&self, q: &[f32], eps: &[u32], ef: usize, lc: usize) -> Vec<DN> {
+    /// `filter(id)` gates admission into the result beam `w` — non-passing
+    /// nodes are still traversed (so the graph stays navigable), they just
+    /// never become results. Build passes an always-true filter.
+    fn search_layer<F: Fn(u64) -> bool>(
+        &self,
+        q: &[f32],
+        eps: &[u32],
+        ef: usize,
+        lc: usize,
+        filter: &F,
+    ) -> Vec<DN> {
         let mut visited = vec![false; self.ids.len()];
         let mut cands: BinaryHeap<Reverse<DN>> = BinaryHeap::new(); // nearest first
         let mut w: BinaryHeap<DN> = BinaryHeap::new(); // farthest on top
@@ -193,7 +203,9 @@ impl HnswIndex {
             let dist = self.d(self.vec_at(e), q);
             visited[e as usize] = true;
             cands.push(Reverse(DN { dist, node: e }));
-            w.push(DN { dist, node: e });
+            if filter(self.ids[e as usize]) {
+                w.push(DN { dist, node: e });
+            }
         }
         while let Some(Reverse(c)) = cands.pop() {
             let farthest = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
@@ -209,9 +221,11 @@ impl HnswIndex {
                 let farthest = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || w.len() < ef {
                     cands.push(Reverse(DN { dist: d, node: nb }));
-                    w.push(DN { dist: d, node: nb });
-                    if w.len() > ef {
-                        w.pop();
+                    if filter(self.ids[nb as usize]) {
+                        w.push(DN { dist: d, node: nb });
+                        if w.len() > ef {
+                            w.pop();
+                        }
                     }
                 }
             }
@@ -260,6 +274,19 @@ impl HnswIndex {
 
     /// Search for the `k` nearest neighbors with beam width `ef_search`.
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<Hit> {
+        self.search_filter(query, k, ef_search, |_| true)
+    }
+
+    /// Filtered search: only ids satisfying `filter` become results. The graph
+    /// is still traversed through non-passing nodes to stay navigable, so use a
+    /// larger `ef_search` when the filter is very selective.
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        filter: F,
+    ) -> Vec<Hit> {
         if k == 0 || self.is_empty() {
             return Vec::new();
         }
@@ -275,7 +302,7 @@ impl HnswIndex {
             (ep, cur) = self.greedy1(&processed, ep, cur, lc);
         }
         let ef = ef_search.max(k);
-        let mut w = self.search_layer(&processed, &[ep], ef, 0);
+        let mut w = self.search_layer(&processed, &[ep], ef, 0, &filter);
         w.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         let hib = self.metric.higher_is_better();
         w.into_iter()
@@ -339,6 +366,33 @@ mod tests {
         }
         let recall = hit as f64 / total as f64;
         assert!(recall >= 0.95, "recall too low: {recall}");
+    }
+
+    #[test]
+    fn hnsw_filtered_search() {
+        let (idx, items) = build(Metric::L2);
+        let mut flat = crate::FlatIndex::new(32, Metric::L2, true);
+        for (id, v) in &items {
+            flat.add(*id, v);
+        }
+        let filter = |id: u64| id.is_multiple_of(3);
+        let mut hit = 0;
+        let mut total = 0;
+        for t in 0..30 {
+            let q = &items[t * 17 % items.len()].1;
+            let got = idx.search_filter(q, 10, 128, filter);
+            assert!(got.iter().all(|h| h.id % 3 == 0));
+            // Ground truth among the filtered subset.
+            let truth: std::collections::HashSet<u64> = flat
+                .search_filter(q, 10, 8, filter)
+                .iter()
+                .map(|h| h.id)
+                .collect();
+            hit += got.iter().filter(|h| truth.contains(&h.id)).count();
+            total += truth.len();
+        }
+        let recall = hit as f64 / total as f64;
+        assert!(recall >= 0.90, "filtered recall too low: {recall}");
     }
 
     #[test]

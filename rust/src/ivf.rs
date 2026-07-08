@@ -144,6 +144,18 @@ impl IvfIndex {
     /// Search the `nprobe` nearest cells for the `k` nearest neighbors.
     /// `oversample` widens the int8 candidate set fed into the f32 rerank.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize, oversample: usize) -> Vec<Hit> {
+        self.search_filter(query, k, nprobe, oversample, |_| true)
+    }
+
+    /// Filtered search: only ids satisfying `filter` enter the candidate set.
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        oversample: usize,
+        filter: F,
+    ) -> Vec<Hit> {
         if k == 0 || self.is_empty() {
             return Vec::new();
         }
@@ -152,6 +164,9 @@ impl IvfIndex {
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for &cell in &cells {
             for i in self.offsets[cell]..self.offsets[cell + 1] {
+                if !filter(self.ids[i]) {
+                    continue;
+                }
                 push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
             }
         }
@@ -699,6 +714,15 @@ mod tests {
         let a: Vec<u64> = idx.search(&q, 10, 32, 8).iter().map(|h| h.id).collect();
         let b: Vec<u64> = idx.search_parallel(&q, 10, 32, 8).iter().map(|h| h.id).collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ivf_filtered_search() {
+        let items = make_items();
+        let idx = IvfIndex::build(2, Metric::L2, 4, &items, true, 15);
+        let hits = idx.search_filter(&[10.0, 10.0], 5, 4, 4, |id| id.is_multiple_of(2));
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h.id.is_multiple_of(2)));
     }
 
     #[test]

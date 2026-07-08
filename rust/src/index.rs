@@ -60,6 +60,8 @@ pub struct View<'a> {
     pub scales: &'a [f32], // len = count
     pub sqnorms: &'a [f32],
     pub raw: Option<&'a [f32]>, // len = count * dim when present
+    /// Per-row tombstones (`true` = deleted); `None` = nothing deleted.
+    pub deleted: Option<&'a [bool]>,
 }
 
 impl<'a> View<'a> {
@@ -71,6 +73,12 @@ impl<'a> View<'a> {
     }
     pub fn has_raw(&self) -> bool {
         self.raw.is_some()
+    }
+
+    /// Whether row `i` is live (not tombstoned).
+    #[inline]
+    fn live(&self, i: usize) -> bool {
+        self.deleted.is_none_or(|d| !d[i])
     }
 
     #[inline]
@@ -100,13 +108,26 @@ impl<'a> View<'a> {
     /// `oversample > 1`, the int8 scan feeds `k * oversample` candidates into
     /// an exact f32 rerank stage.
     pub fn search(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
+        self.search_filter(query, k, oversample, |_| true)
+    }
+
+    /// Search returning only hits whose id satisfies `filter`. The predicate is
+    /// applied during the scan, so filtered-out vectors never enter the
+    /// candidate set (results are the `k` nearest *among the passing* vectors).
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+        filter: F,
+    ) -> Vec<Hit> {
         if k == 0 || self.is_empty() {
             return Vec::new();
         }
         let processed = self.process(query);
         let q = quantize(&processed);
         let cand_n = self.cand_n(k, oversample);
-        let scan = self.scan_serial(&q, cand_n);
+        let scan = self.scan_serial(&q, cand_n, &filter);
         self.finish_search(scan, &processed, k, oversample)
     }
 
@@ -122,10 +143,11 @@ impl<'a> View<'a> {
         let processed = self.process(query);
         let q = quantize(&processed);
         let cand_n = self.cand_n(k, oversample);
+        let all = |_: u64| true;
         let scan = if self.len() < PAR_THRESHOLD {
-            self.scan_serial(&q, cand_n)
+            self.scan_serial(&q, cand_n, &all)
         } else {
-            self.scan_parallel(&q, cand_n)
+            self.scan_parallel(&q, cand_n, &all)
         };
         self.finish_search(scan, &processed, k, oversample)
     }
@@ -160,10 +182,18 @@ impl<'a> View<'a> {
         self.approx_key(i, q, dp)
     }
 
-    /// Serial approximate scan producing the best `cand_n` candidates.
-    fn scan_serial(&self, q: &Quantized, cand_n: usize) -> BinaryHeap<Ranked> {
+    /// Serial approximate scan producing the best `cand_n` passing candidates.
+    fn scan_serial<F: Fn(u64) -> bool>(
+        &self,
+        q: &Quantized,
+        cand_n: usize,
+        filter: &F,
+    ) -> BinaryHeap<Ranked> {
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for i in 0..self.len() {
+            if !self.live(i) || !filter(self.ids[i]) {
+                continue;
+            }
             push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
         }
         heap
@@ -171,14 +201,21 @@ impl<'a> View<'a> {
 
     /// Parallel approximate scan: per-worker bounded top-k heaps, then merged.
     #[cfg(feature = "parallel")]
-    fn scan_parallel(&self, q: &Quantized, cand_n: usize) -> BinaryHeap<Ranked> {
+    fn scan_parallel<F: Fn(u64) -> bool + Sync>(
+        &self,
+        q: &Quantized,
+        cand_n: usize,
+        filter: &F,
+    ) -> BinaryHeap<Ranked> {
         use rayon::prelude::*;
         (0..self.len())
             .into_par_iter()
             .fold(
                 || BinaryHeap::with_capacity(cand_n + 1),
                 |mut heap, i| {
-                    push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
+                    if self.live(i) && filter(self.ids[i]) {
+                        push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
+                    }
                     heap
                 },
             )
@@ -223,6 +260,9 @@ impl<'a> View<'a> {
         let processed = self.process(query);
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(k + 1);
         for i in 0..self.len() {
+            if !self.live(i) {
+                continue;
+            }
             let key = self.exact_key(i, &processed);
             push_bounded(&mut heap, Ranked { key, idx: i }, k);
         }
@@ -282,6 +322,8 @@ pub struct FlatIndex {
     pub(crate) scales: Vec<f32>,
     pub(crate) sqnorms: Vec<f32>,
     pub(crate) raw: Option<Vec<f32>>,
+    pub(crate) deleted: Vec<bool>,
+    pub(crate) deleted_count: usize,
 }
 
 impl FlatIndex {
@@ -298,6 +340,8 @@ impl FlatIndex {
             scales: Vec::new(),
             sqnorms: Vec::new(),
             raw: if keep_raw { Some(Vec::new()) } else { None },
+            deleted: Vec::new(),
+            deleted_count: 0,
         }
     }
 
@@ -316,6 +360,10 @@ impl FlatIndex {
     pub fn has_raw(&self) -> bool {
         self.raw.is_some()
     }
+    /// Number of live (non-deleted) vectors.
+    pub fn live_len(&self) -> usize {
+        self.ids.len() - self.deleted_count
+    }
 
     /// Borrow the index as a [`View`] for querying.
     pub fn view(&self) -> View<'_> {
@@ -327,7 +375,59 @@ impl FlatIndex {
             scales: &self.scales,
             sqnorms: &self.sqnorms,
             raw: self.raw.as_deref(),
+            deleted: if self.deleted_count > 0 {
+                Some(&self.deleted)
+            } else {
+                None
+            },
         }
+    }
+
+    /// Tombstone every row with the given external id. Returns how many rows
+    /// were newly marked deleted. Deleted vectors are excluded from search;
+    /// call [`compact`](Self::compact) to reclaim their space.
+    pub fn remove(&mut self, id: u64) -> usize {
+        let mut removed = 0;
+        for i in 0..self.ids.len() {
+            if self.ids[i] == id && !self.deleted[i] {
+                self.deleted[i] = true;
+                self.deleted_count += 1;
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Physically drop tombstoned rows, compacting the backing storage.
+    pub fn compact(&mut self) {
+        if self.deleted_count == 0 {
+            return;
+        }
+        let dim = self.dim;
+        let mut ids = Vec::with_capacity(self.live_len());
+        let mut codes = Vec::with_capacity(self.live_len() * dim);
+        let mut scales = Vec::with_capacity(self.live_len());
+        let mut sqnorms = Vec::with_capacity(self.live_len());
+        let mut raw = self.raw.as_ref().map(|_| Vec::with_capacity(self.live_len() * dim));
+        for i in 0..self.ids.len() {
+            if self.deleted[i] {
+                continue;
+            }
+            ids.push(self.ids[i]);
+            codes.extend_from_slice(&self.codes[i * dim..(i + 1) * dim]);
+            scales.push(self.scales[i]);
+            sqnorms.push(self.sqnorms[i]);
+            if let (Some(dst), Some(src)) = (raw.as_mut(), self.raw.as_ref()) {
+                dst.extend_from_slice(&src[i * dim..(i + 1) * dim]);
+            }
+        }
+        self.ids = ids;
+        self.codes = codes;
+        self.scales = scales;
+        self.sqnorms = sqnorms;
+        self.raw = raw;
+        self.deleted = vec![false; self.ids.len()];
+        self.deleted_count = 0;
     }
 
     /// Add a vector with an external id.
@@ -343,6 +443,7 @@ impl FlatIndex {
         self.codes.extend_from_slice(&q.codes);
         self.scales.push(q.scale);
         self.sqnorms.push(q.sqnorm);
+        self.deleted.push(false);
         if let Some(raw) = self.raw.as_mut() {
             raw.extend_from_slice(&processed);
         }
@@ -351,6 +452,17 @@ impl FlatIndex {
     /// Search for the `k` nearest neighbors (see [`View::search`]).
     pub fn search(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
         self.view().search(query, k, oversample)
+    }
+
+    /// Filtered search (see [`View::search_filter`]).
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+        filter: F,
+    ) -> Vec<Hit> {
+        self.view().search_filter(query, k, oversample, filter)
     }
 
     /// Parallel single-query search (see [`View::search_parallel`]).
@@ -489,6 +601,39 @@ mod tests {
         assert_eq!(batch.len(), 3);
         let batch0: Vec<u64> = batch[0].iter().map(|h| h.id).collect();
         assert_eq!(batch0, serial);
+    }
+
+    #[test]
+    fn soft_delete_excludes_from_search() {
+        let mut idx = build(Metric::Cosine, true);
+        assert_eq!(idx.live_len(), 4);
+        // id 10 is the nearest to this query; remove it.
+        assert_eq!(idx.remove(10), 1);
+        assert_eq!(idx.remove(10), 0); // already gone
+        assert_eq!(idx.live_len(), 3);
+        let hits = idx.search(&[1.0, 0.0, 0.0, 0.0], 4, 4);
+        assert!(hits.iter().all(|h| h.id != 10));
+        assert_eq!(hits[0].id, 30); // next nearest
+        assert!(idx.search_exact(&[1.0, 0.0, 0.0, 0.0], 4).iter().all(|h| h.id != 10));
+
+        // Compaction drops the tombstone but keeps results identical.
+        idx.compact();
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.live_len(), 3);
+        let hits2 = idx.search(&[1.0, 0.0, 0.0, 0.0], 4, 4);
+        assert_eq!(hits2[0].id, 30);
+    }
+
+    #[test]
+    fn filtered_search_restricts_ids() {
+        let idx = build(Metric::Cosine, true);
+        // Only even ids allowed; query nearest to id 10.
+        let hits = idx.search_filter(&[1.0, 0.0, 0.0, 0.0], 4, 4, |id| id % 20 == 0);
+        assert!(hits.iter().all(|h| h.id % 20 == 0));
+        // ids 10 (no, 10%20!=0), 20, 40 pass; 10 and 30 excluded.
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&20) && ids.contains(&40));
+        assert!(!ids.contains(&10) && !ids.contains(&30));
     }
 
     #[test]

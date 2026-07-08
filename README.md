@@ -301,6 +301,28 @@ IVF 形式も Rust とバイト互換（k-means が決定的になる構成 nlis
 272 バイト一致を確認済み。通常構成では k-means が言語間で異なるためバイトは違うが、
 どちらが書いたファイルも相手が `from_bytes`/`load` で読める）。
 
+## フィルタ付き検索・削除
+
+**メタデータフィルタ**: 述語 `Fn(u64) -> bool` を渡すと、条件を満たす id だけを候補に
+入れて上位 k を返す（Flat / IVF / HNSW 対応）。HNSW はグラフを通過はするが結果には
+通さないので、選択率が低い時は `ef_search` を大きめに。
+
+```rust
+let hits = flat.search_filter(&query, 10, 4, |id| id % 2 == 0);
+let hits = ivf.search_filter(&query, 10, /*nprobe*/16, 4, |id| allow.contains(&id));
+let hits = hnsw.search_filter(&query, 10, /*ef*/128, |id| id < 1000);
+```
+
+**ソフト削除（tombstone）**: `FlatIndex::remove(id)` で論理削除（検索から除外）、
+`compact()` で物理削除して領域回収。削除はメモリ上のみなので、永続化する場合は
+`compact()` 後に `save()`。
+
+```rust
+idx.remove(42);            // tombstone（検索から消える）
+idx.live_len();            // 生存件数
+idx.compact();             // 物理削除して詰める
+```
+
 ## 実データ評価（ANN_SIFT10K）
 
 実データ **SIFT10K**（10,000×128 の SIFT 特徴、100 クエリ、厳密 100-NN の正解付き、
