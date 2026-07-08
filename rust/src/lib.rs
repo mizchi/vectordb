@@ -17,12 +17,14 @@
 //! assert_eq!(hits[0].id, 1);
 //! ```
 
+pub mod bin_quant;
 pub mod distance;
 pub mod index;
 pub mod ivf;
 pub mod quantize;
 pub mod storage;
 
+pub use bin_quant::BinaryIndex;
 pub use index::{FlatIndex, Hit, Metric, View};
 pub use ivf::IvfIndex;
 pub use quantize::{quantize, Quantized};

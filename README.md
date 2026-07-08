@@ -79,6 +79,10 @@ f32 rerank。ベクトルはセル順（CSR）で格納し連続アクセス。
 use vectordb::{IvfIndex, Metric};
 let ivf = IvfIndex::build(dim, Metric::Cosine, /*nlist=*/256, &items, /*keep_raw=*/true, /*kmeans_iters=*/12);
 let hits = ivf.search(&query, 10, /*nprobe=*/4, /*oversample=*/8);
+ivf.save("index.ivf.vecdb")?;                 // 永続化（centroids/セル込み）
+let ivf = IvfIndex::load("index.ivf.vecdb")?; // mmap で読み込み→所有
+let hits = ivf.search_parallel(&query, 10, 32, 8);   // 大規模時セル走査を並列
+let batch = ivf.search_batch(&queries, 10, 4, 8);    // クエリ間並列
 ```
 
 ベンチ例（50k×128, クラスタ構造あり, 対 flat int8+rerank）:
@@ -91,11 +95,32 @@ let hits = ivf.search(&query, 10, /*nprobe=*/4, /*oversample=*/8);
 
 （一様ランダムデータは IVF の最悪ケースで recall が出ない点に注意）
 
+IVF は `save`/`load`（IVF 用 `.vecdb`, magic `VECDBIV1`, centroids + セル offsets 込み）、
+`search_parallel`（セル走査を rayon 分割）、`search_batch`（クエリ間並列）に対応。
+
+### binary（1-bit）量子化, `bin_quant.rs`
+
+各次元を符号ビットに落として `u64` にパック（**f32 比 32x, int8 比 8x 圧縮**）。
+ハミング距離（`popcount(xor)`）で粗選別し、f32 で rerank。angular（cosine/dot）向け。
+
+```rust
+use vectordb::{BinaryIndex, Metric};
+let bin = BinaryIndex::build(dim, Metric::Cosine, &items, /*keep_raw=*/true);
+let hits = bin.search(&query, 10, /*oversample=*/16);
+```
+
+ベンチ例（50k×128, クラスタ構造）: `binary+rerank(o=16)` ≈ 0.46 ms/query, recall@10≈0.90,
+コード 781 KiB（int8 6.25 MiB / f32 25 MiB）。oversample を上げると recall 向上。
+
+> RaBitQ（SIGMOD'24/'25）は符号ビットの精度改良版（ランダム回転 + 誤差限界つき推定量）。
+> 同じパックビット格納の上に `encode`/`estimate` を差し替える形で追加できる（今後）。
+
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
 - `quantize.rs` — int8 スカラ量子化
 - `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
-- `ivf.rs` — IVF（k-means + nprobe 探索）
+- `ivf.rs` — IVF（k-means + nprobe 探索）+ save/load + 並列
+- `bin_quant.rs` — binary(1-bit) 量子化 + ハミング + rerank
 - `storage.rs` — `.vecdb` の save / mmap open / load
 
 ## MoonBit（試作）

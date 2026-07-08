@@ -12,6 +12,12 @@ use crate::distance::{dot_f32, dot_i8, l2sq_f32};
 use crate::index::{push_bounded, Hit, Metric, Ranked};
 use crate::quantize::quantize;
 use std::collections::BinaryHeap;
+use std::io;
+use std::path::Path;
+
+/// Below this many scanned candidates, IVF's parallel search stays serial.
+#[cfg(feature = "parallel")]
+const IVF_PAR_THRESHOLD: usize = 8192;
 
 /// An IVF index over int8-quantized vectors.
 pub struct IvfIndex {
@@ -141,6 +147,85 @@ impl IvfIndex {
         if k == 0 || self.is_empty() {
             return Vec::new();
         }
+        let (processed, q, cells) = self.probe(query, nprobe);
+        let cand_n = self.cand_n(k, oversample);
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
+        for &cell in &cells {
+            for i in self.offsets[cell]..self.offsets[cell + 1] {
+                push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
+            }
+        }
+        self.finish_from(heap, &processed, k, oversample)
+    }
+
+    /// Parallel variant of [`search`](Self::search): the int8 scan over the
+    /// probed cells is split across the rayon pool. Falls back to serial when
+    /// the number of scanned candidates is small.
+    #[cfg(feature = "parallel")]
+    pub fn search_parallel(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        oversample: usize,
+    ) -> Vec<Hit> {
+        use rayon::prelude::*;
+        if k == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        let (processed, q, cells) = self.probe(query, nprobe);
+        let cand_n = self.cand_n(k, oversample);
+        let cand: Vec<usize> = cells
+            .iter()
+            .flat_map(|&c| self.offsets[c]..self.offsets[c + 1])
+            .collect();
+
+        let heap = if cand.len() < IVF_PAR_THRESHOLD {
+            let mut h: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
+            for &i in &cand {
+                push_bounded(&mut h, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
+            }
+            h
+        } else {
+            cand.par_iter()
+                .fold(
+                    || BinaryHeap::with_capacity(cand_n + 1),
+                    |mut h, &i| {
+                        push_bounded(&mut h, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
+                        h
+                    },
+                )
+                .reduce(
+                    || BinaryHeap::with_capacity(cand_n + 1),
+                    |mut a, b| {
+                        for r in b.into_iter() {
+                            push_bounded(&mut a, r, cand_n);
+                        }
+                        a
+                    },
+                )
+        };
+        self.finish_from(heap, &processed, k, oversample)
+    }
+
+    /// Run many queries concurrently (one query per rayon task).
+    #[cfg(feature = "parallel")]
+    pub fn search_batch(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        nprobe: usize,
+        oversample: usize,
+    ) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, nprobe, oversample))
+            .collect()
+    }
+
+    /// Shared query prep: process, quantize, pick the nprobe nearest cells.
+    fn probe(&self, query: &[f32], nprobe: usize) -> (Vec<f32>, crate::quantize::Quantized, Vec<usize>) {
         assert_eq!(query.len(), self.dim, "dimension mismatch");
         let processed = if self.metric == Metric::Cosine {
             normalize(query)
@@ -149,34 +234,40 @@ impl IvfIndex {
         };
         let q = quantize(&processed);
         let nprobe = nprobe.clamp(1, self.nlist);
-
-        // Stage 1: pick the nprobe nearest centroids.
         let cells = self.nearest_cells(&processed, nprobe);
+        (processed, q, cells)
+    }
 
-        // Stage 2: int8 approximate scan over the chosen cells.
-        let cand_n = if self.raw.is_some() {
+    #[inline]
+    fn cand_n(&self, k: usize, oversample: usize) -> usize {
+        if self.raw.is_some() {
             k * oversample.max(1)
         } else {
             k
-        };
-        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
-        for &cell in &cells {
-            for i in self.offsets[cell]..self.offsets[cell + 1] {
-                let dp =
-                    dot_i8(self.codes_at(i), &q.codes) as f32 * self.scales[i] * q.scale;
-                let key = match self.metric {
-                    Metric::L2 => self.sqnorms[i] + q.sqnorm - 2.0 * dp,
-                    Metric::Dot | Metric::Cosine => -dp,
-                };
-                push_bounded(&mut heap, Ranked { key, idx: i }, cand_n);
-            }
         }
+    }
 
-        // Stage 3: exact f32 rerank when originals are kept.
+    #[inline]
+    fn approx_key_at(&self, i: usize, q: &crate::quantize::Quantized) -> f32 {
+        let dp = dot_i8(self.codes_at(i), &q.codes) as f32 * self.scales[i] * q.scale;
+        match self.metric {
+            Metric::L2 => self.sqnorms[i] + q.sqnorm - 2.0 * dp,
+            Metric::Dot | Metric::Cosine => -dp,
+        }
+    }
+
+    /// Exact f32 rerank (when originals kept) then produce sorted hits.
+    fn finish_from(
+        &self,
+        heap: BinaryHeap<Ranked>,
+        processed: &[f32],
+        k: usize,
+        oversample: usize,
+    ) -> Vec<Hit> {
         if self.raw.is_some() && oversample > 1 {
             let mut rr: BinaryHeap<Ranked> = BinaryHeap::with_capacity(k + 1);
             for Ranked { idx, .. } in heap.into_iter() {
-                let key = self.exact_key(idx, &processed);
+                let key = self.exact_key(idx, processed);
                 push_bounded(&mut rr, Ranked { key, idx }, k);
             }
             self.finish(rr)
@@ -223,6 +314,170 @@ impl IvfIndex {
                 score: if hib { -key } else { key },
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence: an IVF-flavored `.vecdb` file (magic "VECDBIV1").
+// Layout (little-endian): 64-byte header + 16-byte-aligned sections:
+//   [header][ centroids f32 ][ offsets u64 ][ ids u64 ]
+//           [ scales f32 ][ sqnorms f32 ][ codes i8 ][ raw f32? ]
+// ---------------------------------------------------------------------------
+
+const IVF_MAGIC: &[u8; 8] = b"VECDBIV1";
+const IVF_VERSION: u32 = 1;
+const IVF_HEADER_LEN: usize = 64;
+const IVF_FLAG_HAS_RAW: u32 = 1;
+
+#[inline]
+fn align16(x: usize) -> usize {
+    (x + 15) & !15
+}
+
+struct IvfLayout {
+    centroids: usize,
+    offsets: usize,
+    ids: usize,
+    scales: usize,
+    sqnorms: usize,
+    codes: usize,
+    raw: usize,
+    total: usize,
+}
+
+fn ivf_layout(dim: usize, count: usize, nlist: usize, has_raw: bool) -> IvfLayout {
+    let centroids = align16(IVF_HEADER_LEN);
+    let offsets = align16(centroids + nlist * dim * 4);
+    let ids = align16(offsets + (nlist + 1) * 8);
+    let scales = align16(ids + count * 8);
+    let sqnorms = align16(scales + count * 4);
+    let codes = align16(sqnorms + count * 4);
+    let raw = align16(codes + count * dim);
+    let total = if has_raw {
+        align16(raw + count * dim * 4)
+    } else {
+        raw
+    };
+    IvfLayout {
+        centroids,
+        offsets,
+        ids,
+        scales,
+        sqnorms,
+        codes,
+        raw,
+        total,
+    }
+}
+
+fn put_f32s(buf: &mut [u8], off: usize, data: &[f32]) {
+    for (i, &x) in data.iter().enumerate() {
+        buf[off + i * 4..off + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+    }
+}
+fn put_u64s(buf: &mut [u8], off: usize, data: impl Iterator<Item = u64>) {
+    for (i, x) in data.enumerate() {
+        buf[off + i * 8..off + i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+    }
+}
+fn get_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn get_u64(b: &[u8], off: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[off..off + 8]);
+    u64::from_le_bytes(a)
+}
+fn get_f32s(b: &[u8], off: usize, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| f32::from_le_bytes([b[off + i * 4], b[off + i * 4 + 1], b[off + i * 4 + 2], b[off + i * 4 + 3]]))
+        .collect()
+}
+
+impl IvfIndex {
+    /// Serialize to an IVF `.vecdb` file.
+    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let dim = self.dim;
+        let count = self.len();
+        let has_raw = self.raw.is_some();
+        let l = ivf_layout(dim, count, self.nlist, has_raw);
+        let mut buf = vec![0u8; l.total];
+
+        buf[0..8].copy_from_slice(IVF_MAGIC);
+        buf[8..12].copy_from_slice(&IVF_VERSION.to_le_bytes());
+        buf[12..16].copy_from_slice(&(self.metric as u32).to_le_bytes());
+        buf[16..20].copy_from_slice(&(dim as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&(count as u32).to_le_bytes());
+        buf[24..28].copy_from_slice(&(if has_raw { IVF_FLAG_HAS_RAW } else { 0 }).to_le_bytes());
+        buf[28..32].copy_from_slice(&(self.nlist as u32).to_le_bytes());
+
+        put_f32s(&mut buf, l.centroids, &self.centroids);
+        put_u64s(&mut buf, l.offsets, self.offsets.iter().map(|&o| o as u64));
+        put_u64s(&mut buf, l.ids, self.ids.iter().copied());
+        put_f32s(&mut buf, l.scales, &self.scales);
+        put_f32s(&mut buf, l.sqnorms, &self.sqnorms);
+        for (i, &c) in self.codes.iter().enumerate() {
+            buf[l.codes + i] = c as u8;
+        }
+        if let Some(raw) = &self.raw {
+            put_f32s(&mut buf, l.raw, raw);
+        }
+
+        std::fs::write(path, &buf)
+    }
+
+    /// Load an IVF `.vecdb` file (parsed via mmap, then copied into owned Vecs).
+    pub fn load(path: impl AsRef<Path>) -> io::Result<IvfIndex> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only mmap of a regular file held open for the call.
+        let m = unsafe { memmap2::Mmap::map(&file)? };
+        let b: &[u8] = &m;
+        let bad = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, format!("ivf: {msg}"));
+        if b.len() < IVF_HEADER_LEN || &b[0..8] != IVF_MAGIC {
+            return Err(bad("bad magic"));
+        }
+        if get_u32(b, 8) != IVF_VERSION {
+            return Err(bad("unsupported version"));
+        }
+        let metric = Metric::from_u32(get_u32(b, 12)).ok_or_else(|| bad("bad metric"))?;
+        let dim = get_u32(b, 16) as usize;
+        let count = get_u32(b, 20) as usize;
+        let has_raw = get_u32(b, 24) & IVF_FLAG_HAS_RAW != 0;
+        let nlist = get_u32(b, 28) as usize;
+        if dim == 0 || nlist == 0 {
+            return Err(bad("zero dim/nlist"));
+        }
+        let l = ivf_layout(dim, count, nlist, has_raw);
+        if b.len() < l.total {
+            return Err(bad("file truncated"));
+        }
+
+        let centroids = get_f32s(b, l.centroids, nlist * dim);
+        let offsets: Vec<usize> = (0..=nlist)
+            .map(|i| get_u64(b, l.offsets + i * 8) as usize)
+            .collect();
+        let ids: Vec<u64> = (0..count).map(|i| get_u64(b, l.ids + i * 8)).collect();
+        let scales = get_f32s(b, l.scales, count);
+        let sqnorms = get_f32s(b, l.sqnorms, count);
+        let codes: Vec<i8> = (0..count * dim).map(|i| b[l.codes + i] as i8).collect();
+        let raw = if has_raw {
+            Some(get_f32s(b, l.raw, count * dim))
+        } else {
+            None
+        };
+
+        Ok(IvfIndex {
+            dim,
+            metric,
+            nlist,
+            centroids,
+            offsets,
+            ids,
+            codes,
+            scales,
+            sqnorms,
+            raw,
+        })
     }
 }
 
@@ -392,6 +647,58 @@ mod tests {
         let a = ivf.search(&q, 1, 4, 8);
         let b = flat.search(&q, 1, 8);
         assert_eq!(a[0].id, b[0].id);
+    }
+
+    #[test]
+    fn ivf_save_load_roundtrip() {
+        let items = make_items();
+        let idx = IvfIndex::build(2, Metric::L2, 4, &items, true, 15);
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_ivf_test.vecdb");
+        idx.save(&path).unwrap();
+
+        let loaded = IvfIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.nlist(), idx.nlist());
+        assert!(loaded.has_raw());
+        let q = [10.0, 10.0];
+        let a = idx.search(&q, 3, 4, 8);
+        let b = loaded.search(&q, 3, 4, 8);
+        assert_eq!(
+            a.iter().map(|h| h.id).collect::<Vec<_>>(),
+            b.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn ivf_parallel_matches_serial() {
+        // Enough vectors that the probed cells exceed IVF_PAR_THRESHOLD.
+        let dim = 8usize;
+        let n = 40_000usize;
+        let mut s: u64 = 0xABCD_1234;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let ncenters = 20usize;
+        let centers: Vec<Vec<f32>> = (0..ncenters)
+            .map(|_| (0..dim).map(|_| next() * 2.0 - 1.0).collect())
+            .collect();
+        let items: Vec<(u64, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let c = &centers[i % ncenters];
+                (i as u64, c.iter().map(|x| x + (next() - 0.5) * 0.1).collect())
+            })
+            .collect();
+        let idx = IvfIndex::build(dim, Metric::L2, 64, &items, true, 8);
+        let q: Vec<f32> = centers[3].iter().map(|x| x + 0.01).collect();
+        let a: Vec<u64> = idx.search(&q, 10, 32, 8).iter().map(|h| h.id).collect();
+        let b: Vec<u64> = idx.search_parallel(&q, 10, 32, 8).iter().map(|h| h.id).collect();
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Run with: `cargo run --release --example bench`
 
 use std::time::Instant;
-use vectordb::{FlatIndex, IvfIndex, Metric};
+use vectordb::{BinaryIndex, FlatIndex, IvfIndex, Metric};
 
 fn main() {
     let n = 50_000usize;
@@ -150,6 +150,28 @@ fn main() {
             approx_dur.as_secs_f64() / dur.as_secs_f64()
         );
     }
+
+    // ---- Binary (1-bit) quantization + rerank ----
+    let bin = BinaryIndex::build(dim, Metric::Cosine, &items, true);
+    let t = Instant::now();
+    let bin_results: Vec<Vec<vectordb::Hit>> =
+        qs.iter().map(|q| bin.search(q, k, 16)).collect();
+    let bin_dur = t.elapsed();
+    println!(
+        "--- binary 1-bit (codes {} KiB = 1/32 of f32) ---",
+        bin.code_bytes() / 1024
+    );
+    println!(
+        "binary+rerank(o=16): {:.3} ms/query  recall@{k}={:.4}",
+        per_query(bin_dur),
+        recall_of(&bin_results)
+    );
+    println!(
+        "  code sizes: binary {} KiB vs int8 {} KiB vs f32 {} KiB",
+        bin.code_bytes() / 1024,
+        n * dim / 1024,
+        n * dim * 4 / 1024
+    );
 }
 
 /// Tiny deterministic xorshift RNG (no external deps).
