@@ -301,6 +301,36 @@ IVF 形式も Rust とバイト互換（k-means が決定的になる構成 nlis
 272 バイト一致を確認済み。通常構成では k-means が言語間で異なるためバイトは違うが、
 どちらが書いたファイルも相手が `from_bytes`/`load` で読める）。
 
+## 実データ評価（ANN_SIFT10K）
+
+実データ **SIFT10K**（10,000×128 の SIFT 特徴、100 クエリ、厳密 100-NN の正解付き、
+metric=L2）での recall@10 / スループット。`examples/eval.rs` で計測。
+
+```bash
+cd rust
+curl -fsSL https://huggingface.co/datasets/vecdata/siftsmall/resolve/main/siftsmall.tar.gz | tar xz
+cargo run --release --example eval -- siftsmall
+```
+
+| 方式 | recall@10 | ms/query | qps |
+|---|---|---|---|
+| flat exact f32 | 1.0000 | 0.29 | 3.4k |
+| flat int8+rerank (o=8) | **1.0000** | 0.24 | 4.1k |
+| binary 1-bit+rerank (o=32) | **0.0370** | 0.13 | 7.9k |
+| RaBitQ flat+rerank (o=32) | **0.9990** | 0.56 | 1.8k |
+| IVF nprobe=16 (o=8) | 0.9980 | 0.068 | 14.8k |
+| IVF+RaBitQ nprobe=16 (o=32) | 0.9980 | 0.59 | 1.7k |
+| HNSW efSearch=32 | 0.9940 | 0.035 | 28.4k |
+| HNSW efSearch=128 | 1.0000 | 0.098 | 10.2k |
+
+読み取れること（実データならでは）:
+- **int8+rerank は実データでも recall 1.0**。省メモリの安全な既定。
+- **素の binary は recall 0.037 で壊滅**。SIFT は値が非負なので符号ビットが全て 1 に
+  なり情報が消える。**RaBitQ は重心を引くので 0.999** — naive binary に対する RaBitQ の
+  優位が実データで明確に出る。
+- **HNSW が最高スループット**（recall 0.994 で 28k qps、flat の ~8倍）。
+- **IVF** は recall/qps のバランスが良い（0.998 で 14.8k qps）。
+
 ## 段階的な拡張
 
 Flat を土台に、同じ距離カーネル・量子化の上へ IVF（セル分割）→ HNSW、量子化は
