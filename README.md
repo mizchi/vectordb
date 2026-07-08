@@ -61,22 +61,24 @@ recall@10 ≒ 1.0、メモリは int8 コード 6MiB（f32 なら 24MiB）。
 
 `v128` SIMD で距離カーネルを書いた試作。int8 内積は `v128_load8x8_s` +
 `i32x4_dot_i16x8_s`、f32 は `v128_load` + `f32x4_*`。SIMD intrinsic はスカラ
-fallback を持つため、`native` / `wasm` / `wasm-gc` / `js` すべてで動く
-（`native` / `wasm` で実際に SIMD 命令になる）。
+fallback を持つため `native` / `wasm` / `wasm-gc` / `js` すべてで動くが、
+**v128 が実ハードウェア SIMD に落ちるのは `wasm` ターゲットのみ**（下表参照）。
+そのため **既定ターゲットを `wasm` に設定**している（`moon.mod` の
+`preferred_target = "wasm"`）。
 
 ```bash
 cd moonbit
-moon test --target native            # 8 tests（距離・量子化・検索・recall）
-moon run cmd/main  --target native   # デモ
-moon run cmd/bench --target native --release   # ベンチ（Rustと同条件）
-# SIMD の効き比較: --target wasm（v128有効） vs --target wasm-gc（スカラ）
+moon test              # 8 tests（既定 = wasm。距離・量子化・検索・recall）
+moon run cmd/main      # デモ
+moon run cmd/bench --release   # ベンチ（Rustと同条件, n=50k）
+# 他バックエンドで動かす場合は --target native / wasm-gc / js を明示
 ```
 
 ### バックエンド別の速度メモ（int8 only / exact f32, ms/query, 参考値）
 
 | 経路 | int8 | exact | 備考 |
 |---|---|---|---|
-| native（既定 = 内蔵 tcc の `tcc -run`） | 最速 | ≈int8 | v128 は**スカラ相当**（int8≈exact） |
+| native（内蔵 tcc の `tcc -run`） | 最速 | ≈int8 | v128 は**スカラ相当**（int8≈exact） |
 | native + clang（`MOON_CC=clang`） | ≈tcc | ≈tcc | tcc とほぼ同じ。v128 は依然スカラ |
 | 新 native（`MOONBIT_NEW_NATIVE=1` + clang） | 遅い | 遅い | 動くが安定版では未最適化。v128 も実SIMD化されず |
 | **wasm（v128 SIMD）** | 4.6 | 5.1 | **v128 が実効**（exact が wasm-gc スカラ比で約2倍速） |
@@ -88,7 +90,8 @@ moon run cmd/bench --target native --release   # ベンチ（Rustと同条件）
 - MoonBit で**ハードウェア SIMD を実際に使えるのは現状 `--target wasm` のみ**。
   native（tcc / clang / 新backend）も、nightly の `llvm` バックエンドも、この環境では
   v128 を x86 SIMD へ落とさずスカラ実行する（llvm はむしろ最も遅い）。
-- 絶対速度が最速なのは既定の native（tcc-run）だが v128 はスカラ。
+- 絶対速度が最速なのは native（tcc-run）だが v128 はスカラなので、SIMD を
+  効かせる本プロジェクトでは既定を `wasm` にしている。
 - Rust(AVX2) は同条件で MoonBit のどのバックエンドより1桁以上速い。
 
 nightly の導入と llvm の実行:
