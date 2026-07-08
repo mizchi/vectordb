@@ -3,7 +3,9 @@
 //! Run with: `cargo run --release --example bench`
 
 use std::time::Instant;
-use vectordb::{BinaryIndex, FlatIndex, IvfIndex, IvfRabitqIndex, Metric, RabitqIndex};
+use vectordb::{
+    BinaryIndex, FlatIndex, HnswIndex, IvfIndex, IvfRabitqIndex, Metric, RabitqIndex,
+};
 
 fn main() {
     let n = 50_000usize;
@@ -204,6 +206,28 @@ fn main() {
         let dur = t.elapsed();
         println!(
             "nprobe=16 oversample={o:<3} {:.3} ms/query  recall@{k}={:.4}",
+            per_query(dur),
+            recall_of(&res)
+        );
+    }
+
+    // ---- HNSW: graph index ----
+    let t = Instant::now();
+    let mut hnsw = HnswIndex::new(dim, Metric::Cosine, 16, 200);
+    for (id, v) in &items {
+        hnsw.add(*id, v);
+    }
+    let hnsw_build = t.elapsed();
+    println!(
+        "--- HNSW (M=16, efC=200, built in {:.2}s) ---",
+        hnsw_build.as_secs_f64()
+    );
+    for &ef in &[16usize, 32, 64, 128] {
+        let t = Instant::now();
+        let res: Vec<Vec<vectordb::Hit>> = qs.iter().map(|q| hnsw.search(q, k, ef)).collect();
+        let dur = t.elapsed();
+        println!(
+            "efSearch={ef:<3} {:.3} ms/query  recall@{k}={:.4}",
             per_query(dur),
             recall_of(&res)
         );

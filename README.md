@@ -98,6 +98,30 @@ let batch = ivf.search_batch(&queries, 10, 4, 8);    // クエリ間並列
 IVF は `save`/`load`（IVF 用 `.vecdb`, magic `VECDBIV1`, centroids + セル offsets 込み）、
 `search_parallel`（セル走査を rayon 分割）、`search_batch`（クエリ間並列）に対応。
 
+### HNSW（グラフ, `hnsw.rs`）
+
+多層 Navigable Small World グラフ（Malkov & Yashunin）。上層から貪欲降下 →
+層0で幅 `ef_search` のビーム探索。**recall/レイテンシは全方式で最良**（グラフの
+エッジ分メモリを使う）。`m`（層あたりエッジ）, `ef_construction`（構築ビーム）,
+`ef_search`（探索ビーム）。近傍選択はヒューリスティック（多様性重視）。
+
+```rust
+use vectordb::{HnswIndex, Metric};
+let mut idx = HnswIndex::new(dim, Metric::Cosine, /*m=*/16, /*ef_construction=*/200);
+idx.add(1, &embedding);
+let hits = idx.search(&query, 10, /*ef_search=*/64);
+```
+
+ベンチ例（50k×128, cosine, 構築 ~8s）:
+
+| ef_search | ms/query | recall@10 |
+|---|---|---|
+| 32 | 0.049 | 0.994 |
+| 64 | 0.069 | 0.9995 |
+| 128 | 0.103 | 1.0000 |
+
+→ **recall 0.99 を 0.05 ms/query**（flat の ~12倍速）。最速レイテンシ。
+
 ### binary（1-bit）量子化, `bin_quant.rs`
 
 各次元を符号ビットに落として `u64` にパック（**f32 比 32x, int8 比 8x 圧縮**）。
@@ -156,6 +180,7 @@ oversample を上げると **int8 の 1/8 のメモリで recall 1.0** に到達
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
 - `quantize.rs` — int8 スカラ量子化
 - `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
+- `hnsw.rs` — HNSW（多層グラフ, 近傍ヒューリスティック）
 - `ivf.rs` — IVF（k-means + nprobe 探索）+ save/load + 並列
 - `bin_quant.rs` — binary(1-bit) 量子化 + ハミング + rerank
 - `rabitq.rs` — RaBitQ(1-bit + 回転 + 不偏推定量) + IVF+RaBitQ
