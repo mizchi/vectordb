@@ -68,10 +68,34 @@ recall@10 ≒ 1.0、メモリは int8 コード 6MiB（f32 なら 24MiB）。
 バックする（小規模では fork/join オーバーヘッドが上回るため）。スレッド並列が不要なら
 `--no-default-features` で `rayon` 依存ごと外せる（`search`/`search_exact` はそのまま利用可）。
 
+### IVF（転置インデックス, `ivf.rs`）
+
+大規模向けに、k-means でベクトルを `nlist` セルに分割し、検索時はクエリに近い
+`nprobe` セルだけを走査する。全件スキャンを避けるので桁違いに速い（データにクラスタ
+構造がある前提。実際の embedding は該当する）。セル内は Flat と同じ int8 スキャン +
+f32 rerank。ベクトルはセル順（CSR）で格納し連続アクセス。
+
+```rust
+use vectordb::{IvfIndex, Metric};
+let ivf = IvfIndex::build(dim, Metric::Cosine, /*nlist=*/256, &items, /*keep_raw=*/true, /*kmeans_iters=*/12);
+let hits = ivf.search(&query, 10, /*nprobe=*/4, /*oversample=*/8);
+```
+
+ベンチ例（50k×128, クラスタ構造あり, 対 flat int8+rerank）:
+
+| nprobe | ms/query | recall@10 | 高速化 |
+|---|---|---|---|
+| 1 | 0.026 | 0.97 | 26.5x |
+| 4 | 0.045 | **1.00** | 14.9x |
+| 8 | 0.061 | 1.00 | 11.0x |
+
+（一様ランダムデータは IVF の最悪ケースで recall が出ない点に注意）
+
 構成:
-- `distance.rs` — f32/int8 距離（スカラ + AVX2）
+- `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
 - `quantize.rs` — int8 スカラ量子化
 - `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
+- `ivf.rs` — IVF（k-means + nprobe 探索）
 - `storage.rs` — `.vecdb` の save / mmap open / load
 
 ## MoonBit（試作）

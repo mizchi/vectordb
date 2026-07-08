@@ -38,7 +38,7 @@ impl Metric {
         }
     }
     #[inline]
-    fn higher_is_better(self) -> bool {
+    pub(crate) fn higher_is_better(self) -> bool {
         matches!(self, Metric::Dot | Metric::Cosine)
     }
 }
@@ -387,9 +387,9 @@ fn normalize(v: &[f32]) -> Vec<f32> {
 }
 
 /// Heap element ordered by `key` (larger key = "worse" = popped first).
-struct Ranked {
-    key: f32,
-    idx: usize,
+pub(crate) struct Ranked {
+    pub(crate) key: f32,
+    pub(crate) idx: usize,
 }
 impl PartialEq for Ranked {
     fn eq(&self, other: &Self) -> bool {
@@ -410,7 +410,7 @@ impl Ord for Ranked {
 
 /// Push into a max-heap capped at `cap`, evicting the current worst.
 #[inline]
-fn push_bounded(heap: &mut BinaryHeap<Ranked>, item: Ranked, cap: usize) {
+pub(crate) fn push_bounded(heap: &mut BinaryHeap<Ranked>, item: Ranked, cap: usize) {
     if cap == 0 {
         return;
     }

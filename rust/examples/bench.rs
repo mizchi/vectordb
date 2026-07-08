@@ -3,7 +3,7 @@
 //! Run with: `cargo run --release --example bench`
 
 use std::time::Instant;
-use vectordb::{FlatIndex, Metric};
+use vectordb::{FlatIndex, IvfIndex, Metric};
 
 fn main() {
     let n = 50_000usize;
@@ -12,15 +12,35 @@ fn main() {
     let k = 10usize;
     let oversample = 8usize;
 
-    println!("generating {n} x {dim} vectors...");
-    let mut idx = FlatIndex::new(dim, Metric::Cosine, true);
+    // Clustered data (like real embeddings): points are drawn around a set of
+    // random centers. IVF relies on this structure; uniform-random data is its
+    // worst case and would show near-zero recall.
+    let n_centers = 250usize;
+    let noise = 0.15f32;
+    println!("generating {n} x {dim} vectors in {n_centers} clusters...");
     let mut rng = Rng::new(0xC0FFEE);
-    for i in 0..n {
-        let v: Vec<f32> = (0..dim).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
-        idx.add(i as u64, &v);
-    }
-    let qs: Vec<Vec<f32>> = (0..queries)
+    let centers: Vec<Vec<f32>> = (0..n_centers)
         .map(|_| (0..dim).map(|_| rng.next_f32() * 2.0 - 1.0).collect())
+        .collect();
+    let jitter = |rng: &mut Rng, c: &[f32]| -> Vec<f32> {
+        c.iter().map(|x| x + (rng.next_f32() * 2.0 - 1.0) * noise).collect()
+    };
+    let items: Vec<(u64, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let c = &centers[(rng.next_u64() as usize) % n_centers];
+            (i as u64, jitter(&mut rng, c))
+        })
+        .collect();
+    let mut idx = FlatIndex::new(dim, Metric::Cosine, true);
+    for (id, v) in &items {
+        idx.add(*id, v);
+    }
+    // Queries drawn from the same cluster distribution.
+    let qs: Vec<Vec<f32>> = (0..queries)
+        .map(|_| {
+            let c = &centers[(rng.next_u64() as usize) % n_centers];
+            jitter(&mut rng, c)
+        })
         .collect();
 
     // Warm up + measure quantized+rerank search.
@@ -97,6 +117,37 @@ fn main() {
             "int8+rerank single(par):    {:.3} ms/query  ({:.1}x vs serial)",
             per_query(single_dur),
             approx_dur.as_secs_f64() / single_dur.as_secs_f64()
+        );
+    }
+
+    // ---- IVF: coarse quantization, scan only nprobe cells ----
+    let nlist = 256usize;
+    let t = Instant::now();
+    let ivf = IvfIndex::build(dim, Metric::Cosine, nlist, &items, true, 12);
+    let ivf_build = t.elapsed();
+    println!("--- IVF (nlist={nlist}, built in {:.2}s) vs flat exact ---", ivf_build.as_secs_f64());
+
+    let recall_of = |results: &[Vec<vectordb::Hit>]| -> f64 {
+        let mut h = 0usize;
+        let mut tot = 0usize;
+        for (a, e) in results.iter().zip(exact_results.iter()) {
+            let truth: std::collections::HashSet<u64> = e.iter().map(|x| x.id).collect();
+            h += a.iter().filter(|x| truth.contains(&x.id)).count();
+            tot += e.len();
+        }
+        h as f64 / tot as f64
+    };
+
+    for &nprobe in &[1usize, 4, 8, 16, 32] {
+        let t = Instant::now();
+        let results: Vec<Vec<vectordb::Hit>> =
+            qs.iter().map(|q| ivf.search(q, k, nprobe, oversample)).collect();
+        let dur = t.elapsed();
+        println!(
+            "nprobe={nprobe:<3} {:.3} ms/query  recall@{k}={:.4}  ({:.1}x vs flat int8+rerank)",
+            per_query(dur),
+            recall_of(&results),
+            approx_dur.as_secs_f64() / dur.as_secs_f64()
         );
     }
 }

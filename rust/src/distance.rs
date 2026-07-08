@@ -131,16 +131,30 @@ unsafe fn l2sq_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
     use std::arch::x86_64::*;
     let n = a.len();
-    let mut acc = _mm256_setzero_si256();
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    // Two independent accumulators over 32 int8 / iteration to hide the latency
+    // of cvtepi8_epi16 + madd_epi16 (better instruction-level parallelism).
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
     let mut i = 0;
-    // 16 int8 per iteration: sign-extend to i16x16, madd to i32x8.
-    while i + 16 <= n {
-        let av = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.as_ptr().add(i) as *const __m128i));
-        let bv = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i) as *const __m128i));
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(av, bv));
-    i += 16;
+    while i + 32 <= n {
+        let a0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i));
+        let b0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i));
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0, b0));
+        let a1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i + 16) as *const __m128i));
+        let b1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i + 16) as *const __m128i));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1, b1));
+        i += 32;
     }
-    let mut sum = hsum256_epi32(acc);
+    // 16-wide tail.
+    while i + 16 <= n {
+        let av = _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i));
+        let bv = _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i));
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(av, bv));
+        i += 16;
+    }
+    let mut sum = hsum256_epi32(_mm256_add_epi32(acc0, acc1));
     while i < n {
         sum += (*a.get_unchecked(i) as i32) * (*b.get_unchecked(i) as i32);
         i += 1;

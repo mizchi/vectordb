@@ -19,9 +19,11 @@
 
 pub mod distance;
 pub mod index;
+pub mod ivf;
 pub mod quantize;
 pub mod storage;
 
 pub use index::{FlatIndex, Hit, Metric, View};
+pub use ivf::IvfIndex;
 pub use quantize::{quantize, Quantized};
 pub use storage::{load, open, save, MmapIndex};
