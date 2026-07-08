@@ -157,6 +157,28 @@ impl MmapIndex {
     pub fn search(&self, query: &[f32], k: usize, oversample: usize) -> Vec<crate::index::Hit> {
         self.view().search(query, k, oversample)
     }
+
+    /// Parallel single-query search (see [`View::search_parallel`]).
+    #[cfg(feature = "parallel")]
+    pub fn search_parallel(
+        &self,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+    ) -> Vec<crate::index::Hit> {
+        self.view().search_parallel(query, k, oversample)
+    }
+
+    /// Concurrent batch search (see [`View::search_batch`]).
+    #[cfg(feature = "parallel")]
+    pub fn search_batch(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        oversample: usize,
+    ) -> Vec<Vec<crate::index::Hit>> {
+        self.view().search_batch(queries, k, oversample)
+    }
 }
 
 /// Open a `.vecdb` file as a zero-copy mmap index.

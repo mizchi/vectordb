@@ -9,6 +9,13 @@ use crate::quantize::{dequantize, quantize, Quantized};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+/// Below this many vectors, a single-query scan stays serial: the rayon
+/// fork/join + heap-merge overhead outweighs the work. Measured break-even on
+/// 4 cores is roughly here (≈0.8x speedup at 50k, ≈2x at 400k), so only large
+/// indexes take the parallel path. Batch search parallelizes regardless.
+#[cfg(feature = "parallel")]
+const PAR_THRESHOLD: usize = 131_072;
+
 /// Similarity / distance metric.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -98,29 +105,112 @@ impl<'a> View<'a> {
         }
         let processed = self.process(query);
         let q = quantize(&processed);
-        let count = self.len();
+        let cand_n = self.cand_n(k, oversample);
+        let scan = self.scan_serial(&q, cand_n);
+        self.finish_search(scan, &processed, k, oversample)
+    }
 
-        let cand_n = if self.raw.is_some() {
+    /// Like [`search`](Self::search), but the int8 scan of a single query is
+    /// split across the rayon thread pool (each worker keeps a local top-k that
+    /// is merged at the end). Falls back to the serial scan below a threshold
+    /// where thread overhead would dominate.
+    #[cfg(feature = "parallel")]
+    pub fn search_parallel(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
+        if k == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        let processed = self.process(query);
+        let q = quantize(&processed);
+        let cand_n = self.cand_n(k, oversample);
+        let scan = if self.len() < PAR_THRESHOLD {
+            self.scan_serial(&q, cand_n)
+        } else {
+            self.scan_parallel(&q, cand_n)
+        };
+        self.finish_search(scan, &processed, k, oversample)
+    }
+
+    /// Run many queries concurrently (one query per rayon task). Best for
+    /// throughput when you have a batch of queries; each query itself uses the
+    /// serial scan.
+    #[cfg(feature = "parallel")]
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, oversample: usize) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, oversample))
+            .collect()
+    }
+
+    /// Number of int8 candidates the scan should keep before reranking.
+    #[inline]
+    fn cand_n(&self, k: usize, oversample: usize) -> usize {
+        let count = self.len();
+        if self.raw.is_some() {
             (k * oversample.max(1)).min(count)
         } else {
             k.min(count)
-        };
-        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
-        for i in 0..count {
-            let dp = dot_i8(self.codes_at(i), &q.codes) as f32 * self.scales[i] * q.scale;
-            let key = self.approx_key(i, &q, dp);
-            push_bounded(&mut heap, Ranked { key, idx: i }, cand_n);
         }
+    }
 
+    /// Approximate int8 ranking key for candidate `i` (lower = better).
+    #[inline]
+    fn approx_key_at(&self, i: usize, q: &Quantized) -> f32 {
+        let dp = dot_i8(self.codes_at(i), &q.codes) as f32 * self.scales[i] * q.scale;
+        self.approx_key(i, q, dp)
+    }
+
+    /// Serial approximate scan producing the best `cand_n` candidates.
+    fn scan_serial(&self, q: &Quantized, cand_n: usize) -> BinaryHeap<Ranked> {
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
+        for i in 0..self.len() {
+            push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
+        }
+        heap
+    }
+
+    /// Parallel approximate scan: per-worker bounded top-k heaps, then merged.
+    #[cfg(feature = "parallel")]
+    fn scan_parallel(&self, q: &Quantized, cand_n: usize) -> BinaryHeap<Ranked> {
+        use rayon::prelude::*;
+        (0..self.len())
+            .into_par_iter()
+            .fold(
+                || BinaryHeap::with_capacity(cand_n + 1),
+                |mut heap, i| {
+                    push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
+                    heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::with_capacity(cand_n + 1),
+                |mut a, b| {
+                    for r in b.into_iter() {
+                        push_bounded(&mut a, r, cand_n);
+                    }
+                    a
+                },
+            )
+    }
+
+    /// Rerank a widened candidate set (when originals are kept) and produce the
+    /// final best-first hits.
+    fn finish_search(
+        &self,
+        scan: BinaryHeap<Ranked>,
+        processed: &[f32],
+        k: usize,
+        oversample: usize,
+    ) -> Vec<Hit> {
         if self.raw.is_some() && oversample > 1 {
             let mut rr: BinaryHeap<Ranked> = BinaryHeap::with_capacity(k + 1);
-            for Ranked { idx, .. } in heap.into_iter() {
-                let key = self.exact_key(idx, &processed);
+            for Ranked { idx, .. } in scan.into_iter() {
+                let key = self.exact_key(idx, processed);
                 push_bounded(&mut rr, Ranked { key, idx }, k);
             }
             self.finish(rr)
         } else {
-            self.finish(heap)
+            self.finish(scan)
         }
     }
 
@@ -263,6 +353,18 @@ impl FlatIndex {
         self.view().search(query, k, oversample)
     }
 
+    /// Parallel single-query search (see [`View::search_parallel`]).
+    #[cfg(feature = "parallel")]
+    pub fn search_parallel(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
+        self.view().search_parallel(query, k, oversample)
+    }
+
+    /// Concurrent batch search (see [`View::search_batch`]).
+    #[cfg(feature = "parallel")]
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, oversample: usize) -> Vec<Vec<Hit>> {
+        self.view().search_batch(queries, k, oversample)
+    }
+
     /// Exact full-precision search (requires `keep_raw = true`).
     pub fn search_exact(&self, query: &[f32], k: usize) -> Vec<Hit> {
         self.view().search_exact(query, k)
@@ -357,6 +459,36 @@ mod tests {
         assert!(!idx.has_raw());
         let hits = idx.search(&[1.0, 0.0, 0.0, 0.0], 2, 4);
         assert_eq!(hits[0].id, 10);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_matches_serial_on_large_set() {
+        let dim = 16usize;
+        let n = 140_000usize; // exceed PAR_THRESHOLD to exercise the parallel path
+        let mut idx = FlatIndex::new(dim, Metric::Cosine, true);
+        let mut s: u64 = 0x1234_5678;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            idx.add(i as u64, &v);
+        }
+        let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+
+        let serial: Vec<u64> = idx.search(&q, 10, 8).iter().map(|h| h.id).collect();
+        let parallel: Vec<u64> = idx.search_parallel(&q, 10, 8).iter().map(|h| h.id).collect();
+        assert_eq!(serial, parallel);
+
+        let qs = vec![q.clone(), q.clone(), q.clone()];
+        let batch = idx.search_batch(&qs, 10, 8);
+        assert_eq!(batch.len(), 3);
+        let batch0: Vec<u64> = batch[0].iter().map(|h| h.id).collect();
+        assert_eq!(batch0, serial);
     }
 
     #[test]

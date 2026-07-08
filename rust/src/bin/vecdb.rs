@@ -119,7 +119,16 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
         if qv.len() != m.dim() {
             return Err(format!("query {qid}: dim {} != {}", qv.len(), m.dim()));
         }
-        let hits = m.search(qv, k, over);
+    }
+    let qvs: Vec<Vec<f32>> = queries.iter().map(|(_, v)| v.clone()).collect();
+
+    // Search all queries at once; the parallel build spreads them across cores.
+    #[cfg(feature = "parallel")]
+    let results = m.search_batch(&qvs, k, over);
+    #[cfg(not(feature = "parallel"))]
+    let results: Vec<_> = qvs.iter().map(|v| m.search(v, k, over)).collect();
+
+    for ((qid, _), hits) in queries.iter().zip(results.iter()) {
         for (rank, h) in hits.iter().enumerate() {
             println!("{qid}\t{rank}\t{}\t{:.6}", h.id, h.score);
         }

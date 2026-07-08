@@ -70,6 +70,35 @@ fn main() {
         n * dim / (1024 * 1024),
         n * dim * 4 / (1024 * 1024)
     );
+
+    #[cfg(feature = "parallel")]
+    {
+        let threads = rayon::current_num_threads();
+
+        // Throughput: whole batch across threads (one query per task).
+        let t = Instant::now();
+        std::hint::black_box(idx.search_batch(&qs, k, oversample));
+        let batch_dur = t.elapsed();
+
+        // Latency: each query's scan split across threads.
+        let t = Instant::now();
+        for q in &qs {
+            std::hint::black_box(idx.search_parallel(q, k, oversample));
+        }
+        let single_dur = t.elapsed();
+
+        println!("--- parallel ({threads} threads) ---");
+        println!(
+            "int8+rerank batch:          {:.3} ms/query  ({:.1}x vs serial)",
+            per_query(batch_dur),
+            approx_dur.as_secs_f64() / batch_dur.as_secs_f64()
+        );
+        println!(
+            "int8+rerank single(par):    {:.3} ms/query  ({:.1}x vs serial)",
+            per_query(single_dur),
+            approx_dur.as_secs_f64() / single_dur.as_secs_f64()
+        );
+    }
 }
 
 /// Tiny deterministic xorshift RNG (no external deps).

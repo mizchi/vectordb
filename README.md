@@ -46,15 +46,32 @@ let hits = idx.search(&query, 10, /*oversample=*/4); // Vec<Hit{id, score}>
 save(&idx, "idx.vecdb")?;          // 単一ファイルに保存
 let m = open("idx.vecdb")?;        // mmap でゼロコピー読み込み
 let hits = m.search(&query, 10, 4);
+
+// 並列（parallel フィーチャ、既定ON。rayon）
+let results = idx.search_batch(&queries, 10, 4);   // 複数クエリをコア分散（スループット）
+let hits = idx.search_parallel(&query, 10, 4);     // 1クエリを分割（大規模Nのみ有効）
 ```
 
 ベンチ例（50k×128, Cosine, ローカル参考値）: int8+rerank が exact の約 2〜3 倍速、
 recall@10 ≒ 1.0、メモリは int8 コード 6MiB（f32 なら 24MiB）。
 
+### 並列化（`parallel` フィーチャ, 既定ON）
+
+`rayon` で2種類の並列を提供:
+
+| API | 種類 | 4コアでの効果（参考） |
+|---|---|---|
+| `search_batch` | クエリ間（1クエリ/タスク） | **約3.3〜3.8x**（ほぼ線形）。スループット向け |
+| `search_parallel` | クエリ内（1クエリのスキャンを分割） | 大規模 N のみ有効（50k=1.0x, 400k=約2x） |
+
+`search_parallel` は `PAR_THRESHOLD`（=131072 件）未満では自動的にシリアルにフォール
+バックする（小規模では fork/join オーバーヘッドが上回るため）。スレッド並列が不要なら
+`--no-default-features` で `rayon` 依存ごと外せる（`search`/`search_exact` はそのまま利用可）。
+
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2）
 - `quantize.rs` — int8 スカラ量子化
-- `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）
+- `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
 - `storage.rs` — `.vecdb` の save / mmap open / load
 
 ## MoonBit（試作）
