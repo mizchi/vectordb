@@ -418,3 +418,72 @@ test "binary 1-bit + rerank recall vs exact" {
   let recall = hit.to_double() / total.to_double()
   assert_true(recall >= 0.90)
 }
+
+///|
+test "rabitq rerank high recall + fast scan works" {
+  let dim = 64
+  let ncenters = 20
+  let rng = Rng::{ state: 0xBEEF_1234_5678_9AB0UL }
+  let centers : Array[Array[Float]] = []
+  for _c in 0..<ncenters {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    centers.push(v)
+  }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<2000 {
+    let c = centers[i % ncenters]
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = c[j] + (rng.unit() - 0.5) * 0.2
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let rq = RaBitqIndex::build(vectors, ids, Cosine, true, 1UL)
+  let flat = FlatIndex::build(vectors, ids, Cosine, true)
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<30 {
+    let c = centers[t % ncenters]
+    let q = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      q[j] = c[j] + 0.01
+    }
+    let got = rq.search(q, 10, 32)
+    let truth = flat.search_exact(q, 10)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.90)
+}
+
+///|
+test "rabitq l2 finds self" {
+  let dim = 32
+  let rng = Rng::{ state: 0x0102030405060708UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<300 {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let rq = RaBitqIndex::build(vectors, ids, L2, true, 3UL)
+  let hits = rq.search(vectors[5], 1, 16)
+  assert_eq(hits[0].id, 5L)
+}
