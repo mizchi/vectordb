@@ -127,9 +127,37 @@ query(f32)
  └─ rerank: raw f32 があれば厳密距離で再スコア → 上位 k
 ```
 
-## 8. 段階的拡張の余地
+## 8. 実装状況
 
-- IVF: `codes` の前段に k-means セル割当と転置リストを足す（距離カーネルは共通）。
-- PQ / RaBitQ: `quantize` に別エンコーダを追加、`codes` の意味を差し替え。
-- HNSW: グラフセクションを追加。
-- 並列化・mmap prefetch・SIMD の int8 経路（AVX2 `maddubs`）。
+当初「段階的拡張の余地」として挙げた項目は概ね実装済み。現状の全体像:
+
+### インデックス（Rust / MoonBit 両実装）
+- **Flat**: int8 スキャン + f32 rerank、上限付き top-k ヒープ。
+- **IVF**: k-means（**k-means++ 初期化**）+ nprobe 探索、CSR 格納。
+- **HNSW**: 多層グラフ、近傍ヒューリスティック、ef 探索。
+
+### 量子化（Rust）
+- int8 スカラ / **binary(1-bit, Hamming)** / **RaBitQ(回転+符号+不偏推定)** /
+  **IVF+RaBitQ**（セル毎重心）。MoonBit は int8 / binary。
+
+### 運用機能（Rust）
+- **フィルタ付き検索**（述語, Flat/IVF/HNSW）、**ソフト削除 + compact**、**upsert**、
+  **バッチ挿入**（rayon 並列）、**ペイロード**（メタデータ、in-memory）。
+- **rayon 並列**（クエリ内/バッチ）、**mmap 永続化**。
+- 全索引が `.vecdb` 系フォーマットで **save/load**（Flat=`VECDB1`, IVF=`VECDBIV1`,
+  HNSW=`VECDBHN1`）。CLI `vecdb` から build/search/info（種別自動判定）。
+
+### 評価
+- 合成クラスタ + 実データ **ANN_SIFT10K**（`examples/eval.rs`）で recall/QPS を実測。
+  binary が SIFT(非負値)で崩れ RaBitQ が復元する、等の知見を README に記録。
+
+### SIMD
+- Rust: AVX2（f32 dot/l2, int8 32要素/反復）実行時分岐 + スカラ fallback。
+- MoonBit: `v128`（`--target wasm` で実効。native/llvm はスカラ）。
+
+## 9. 今後の余地
+
+- ペイロードや tombstone の永続化（`.vecdb` 形式のバージョン拡張）。
+- HNSW の量子化版（int8 グラフで省メモリ）、IVF/HNSW の削除・更新。
+- MoonBit への RaBitQ / 並列 / mmap 相当の移植。
+- PQ（Product Quantization）、フィルタ選択率に応じた探索の適応化。

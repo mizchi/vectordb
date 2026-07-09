@@ -324,6 +324,9 @@ pub struct FlatIndex {
     pub(crate) raw: Option<Vec<f32>>,
     pub(crate) deleted: Vec<bool>,
     pub(crate) deleted_count: usize,
+    /// Optional per-row metadata (empty = none). In-memory only (not persisted
+    /// to `.vecdb`).
+    pub(crate) payloads: Vec<Vec<u8>>,
 }
 
 impl FlatIndex {
@@ -342,6 +345,7 @@ impl FlatIndex {
             raw: if keep_raw { Some(Vec::new()) } else { None },
             deleted: Vec::new(),
             deleted_count: 0,
+            payloads: Vec::new(),
         }
     }
 
@@ -417,6 +421,7 @@ impl FlatIndex {
         let mut scales = Vec::with_capacity(self.live_len());
         let mut sqnorms = Vec::with_capacity(self.live_len());
         let mut raw = self.raw.as_ref().map(|_| Vec::with_capacity(self.live_len() * dim));
+        let mut payloads = Vec::with_capacity(self.live_len());
         for i in 0..self.ids.len() {
             if self.deleted[i] {
                 continue;
@@ -425,6 +430,7 @@ impl FlatIndex {
             codes.extend_from_slice(&self.codes[i * dim..(i + 1) * dim]);
             scales.push(self.scales[i]);
             sqnorms.push(self.sqnorms[i]);
+            payloads.push(std::mem::take(&mut self.payloads[i]));
             if let (Some(dst), Some(src)) = (raw.as_mut(), self.raw.as_ref()) {
                 dst.extend_from_slice(&src[i * dim..(i + 1) * dim]);
             }
@@ -434,6 +440,7 @@ impl FlatIndex {
         self.scales = scales;
         self.sqnorms = sqnorms;
         self.raw = raw;
+        self.payloads = payloads;
         self.deleted = vec![false; self.ids.len()];
         self.deleted_count = 0;
     }
@@ -452,9 +459,28 @@ impl FlatIndex {
         self.scales.push(q.scale);
         self.sqnorms.push(q.sqnorm);
         self.deleted.push(false);
+        self.payloads.push(Vec::new());
         if let Some(raw) = self.raw.as_mut() {
             raw.extend_from_slice(&processed);
         }
+    }
+
+    /// Add a vector with an external id and an attached metadata payload
+    /// (arbitrary bytes). Payloads are in-memory only (not written to `.vecdb`).
+    pub fn add_with_payload(&mut self, id: u64, vector: &[f32], payload: &[u8]) {
+        self.add(id, vector);
+        *self.payloads.last_mut().unwrap() = payload.to_vec();
+    }
+
+    /// The metadata payload of the first live row with `id`, if any (empty
+    /// payloads and unknown ids return `None`).
+    pub fn payload(&self, id: u64) -> Option<&[u8]> {
+        for i in 0..self.ids.len() {
+            if self.ids[i] == id && !self.deleted[i] && !self.payloads[i].is_empty() {
+                return Some(&self.payloads[i]);
+            }
+        }
+        None
     }
 
     /// Add many vectors at once. With the `parallel` feature the per-vector
@@ -483,6 +509,7 @@ impl FlatIndex {
                 self.scales.push(q.scale);
                 self.sqnorms.push(q.sqnorm);
                 self.deleted.push(false);
+                self.payloads.push(Vec::new());
                 if let (Some(raw), Some(p)) = (self.raw.as_mut(), kept) {
                     raw.extend_from_slice(&p);
                 }
@@ -648,6 +675,24 @@ mod tests {
         assert_eq!(batch.len(), 3);
         let batch0: Vec<u64> = batch[0].iter().map(|h| h.id).collect();
         assert_eq!(batch0, serial);
+    }
+
+    #[test]
+    fn payload_attach_lookup_and_compact() {
+        let mut idx = FlatIndex::new(4, Metric::Cosine, true);
+        idx.add_with_payload(10, &[1.0, 0.0, 0.0, 0.0], b"doc-ten");
+        idx.add(20, &[0.0, 1.0, 0.0, 0.0]); // no payload
+        idx.add_with_payload(30, &[0.9, 0.1, 0.0, 0.0], b"doc-thirty");
+        assert_eq!(idx.payload(10), Some(&b"doc-ten"[..]));
+        assert_eq!(idx.payload(20), None);
+        assert_eq!(idx.payload(30), Some(&b"doc-thirty"[..]));
+        assert_eq!(idx.payload(999), None);
+        // Deleting removes the payload from lookup; compaction keeps the rest.
+        idx.remove(10);
+        assert_eq!(idx.payload(10), None);
+        idx.compact();
+        assert_eq!(idx.payload(30), Some(&b"doc-thirty"[..]));
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]

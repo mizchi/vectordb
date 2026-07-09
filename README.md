@@ -334,6 +334,15 @@ let hits = ivf.search_filter(&query, 10, /*nprobe*/16, 4, |id| allow.contains(&i
 let hits = hnsw.search_filter(&query, 10, /*ef*/128, |id| id < 1000);
 ```
 
+**ペイロード（メタデータ）**: `add_with_payload(id, vec, bytes)` で各ベクトルに任意の
+バイト列を付与し、`payload(id)` で取得できる（検索は id を返すので id→payload を引く）。
+メモリ上のみで `.vecdb` には保存しない。
+
+```rust
+idx.add_with_payload(1, &emb, br#"{"title":"..."}"#);
+let meta: Option<&[u8]> = idx.payload(1);
+```
+
 **ソフト削除（tombstone）**: `FlatIndex::remove(id)` で論理削除（検索から除外）、
 `compact()` で物理削除して領域回収。削除はメモリ上のみなので、永続化する場合は
 `compact()` 後に `save()`。

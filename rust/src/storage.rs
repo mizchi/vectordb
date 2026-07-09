@@ -254,6 +254,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<FlatIndex> {
         idx.raw.as_mut().unwrap().extend_from_slice(raw);
     }
     idx.deleted = vec![false; idx.ids.len()];
+    idx.payloads = vec![Vec::new(); idx.ids.len()];
     Ok(idx)
 }
 
