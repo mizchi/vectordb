@@ -31,6 +31,100 @@ fn sub_slice(v : Array[Float], off : Int, len : Int) -> Array[Float] {
   out
 }
 
+// ---------------------------------------------------------------------------
+// Shared PQ primitives, reused by PqIndex, IvfPqIndex, and OpqIndex.
+// ---------------------------------------------------------------------------
+
+///|
+/// Train `m` per-subspace codebooks (each `ksub` centroids of `dsub`) over
+/// `rows` (n vectors of dim = m*dsub). Returns `m*ksub` rows (`[j*ksub + c]`).
+fn pq_train(
+  rows : Array[Array[Float]],
+  m : Int,
+  ksub : Int,
+  dsub : Int,
+  iters : Int,
+) -> Array[Array[Float]] {
+  let cb : Array[Array[Float]] = Array::make(m * ksub, [])
+  let n = rows.length()
+  for j in 0..<m {
+    let sub : Array[Array[Float]] = []
+    for i in 0..<n {
+      sub.push(sub_slice(rows[i], j * dsub, dsub))
+    }
+    // renorm=false: per-subspace renorm would distort geometry.
+    let (cen, _) = kmeans(sub, ksub, iters, false)
+    for c in 0..<ksub {
+      cb[j * ksub + c] = cen[c]
+    }
+  }
+  cb
+}
+
+///|
+/// Encode one vector into `m` PQ codes (nearest centroid per subspace by L2).
+fn pq_encode(
+  cb : Array[Array[Float]],
+  m : Int,
+  ksub : Int,
+  dsub : Int,
+  v : Array[Float],
+) -> FixedArray[Byte] {
+  let out : FixedArray[Byte] = FixedArray::make(m, 0)
+  for j in 0..<m {
+    let vs = sub_slice(v, j * dsub, dsub)
+    let mut best = 0
+    let mut best_d : Float = 3.0e38
+    for c in 0..<ksub {
+      let d = l2_arr(vs, cb[j * ksub + c])
+      if d < best_d {
+        best_d = d
+        best = c
+      }
+    }
+    out[j] = best.to_byte()
+  }
+  out
+}
+
+///|
+/// ADC lookup table for `query`: `lut[j*ksub + c]` is the subspace-j,
+/// centroid-c contribution (squared-L2 when l2, else dot product).
+fn pq_lut(
+  cb : Array[Array[Float]],
+  m : Int,
+  ksub : Int,
+  dsub : Int,
+  query : Array[Float],
+  l2 : Bool,
+) -> Array[Float] {
+  let lut = Array::make(m * ksub, (0.0 : Float))
+  for j in 0..<m {
+    let qs = sub_slice(query, j * dsub, dsub)
+    for c in 0..<ksub {
+      let cen = cb[j * ksub + c]
+      lut[j * ksub + c] = if l2 { l2_arr(qs, cen) } else { dot_arr(qs, cen) }
+    }
+  }
+  lut
+}
+
+///|
+/// Sum an ADC table over `m` codes starting at `codes[off]`.
+fn pq_adc_sum(
+  lut : Array[Float],
+  ksub : Int,
+  codes : FixedArray[Byte],
+  off : Int,
+  m : Int,
+) -> Float {
+  let mut acc : Float = 0.0
+  for j in 0..<m {
+    acc = acc + lut[j * ksub + codes[off + j].to_int()]
+  }
+  acc
+}
+
 ///|
 /// Build a PQ index. `m` must divide `dim`; `ksub <= 256`.
 pub fn PqIndex::build(
@@ -66,21 +160,12 @@ pub fn PqIndex::build(
     }
     proc.push(if cos { normalize(vectors[i]) } else { copy_row(vectors[i]) })
   }
-  let codebooks : Array[Array[Float]] = Array::make(m * ks, [])
+  let codebooks = pq_train(proc, m, ks, dsub, kmeans_iters)
   let codes : FixedArray[Byte] = FixedArray::make(n * m, 0)
-  for j in 0..<m {
-    // Sub-matrix for subspace j.
-    let sub : Array[Array[Float]] = []
-    for i in 0..<n {
-      sub.push(sub_slice(proc[i], j * dsub, dsub))
-    }
-    // renorm=false: per-subspace renorm would distort geometry.
-    let (centroids, assign) = kmeans(sub, ks, kmeans_iters, false)
-    for c in 0..<ks {
-      codebooks[j * ks + c] = centroids[c]
-    }
-    for i in 0..<n {
-      codes[i * m + j] = assign[i].to_byte()
+  for i in 0..<n {
+    let c = pq_encode(codebooks, m, ks, dsub, proc[i])
+    for j in 0..<m {
+      codes[i * m + j] = c[j]
     }
   }
   let raw : FixedArray[Byte]? = if keep_raw {
@@ -119,29 +204,6 @@ pub fn PqIndex::code_bytes(self : PqIndex) -> Int {
 }
 
 ///|
-/// Build the ADC lookup table for `query`: `lut[j*ksub + c]` is the subspace-j,
-/// centroid-c contribution (squared-L2 when l2, else dot product).
-fn PqIndex::build_lut(
-  self : PqIndex,
-  query : Array[Float],
-  l2 : Bool,
-) -> Array[Float] {
-  let lut = Array::make(self.m * self.ksub, (0.0 : Float))
-  for j in 0..<self.m {
-    let qs = sub_slice(query, j * self.dsub, self.dsub)
-    for c in 0..<self.ksub {
-      let cen = self.codebooks[j * self.ksub + c]
-      lut[j * self.ksub + c] = if l2 {
-        l2_arr(qs, cen)
-      } else {
-        dot_arr(qs, cen)
-      }
-    }
-  }
-  lut
-}
-
-///|
 /// Search for the k nearest neighbors with ADC, then rerank `k*oversample`
 /// candidates with exact f32 distances (if originals kept).
 pub fn PqIndex::search(
@@ -158,17 +220,14 @@ pub fn PqIndex::search(
   }
   let processed = if is_cosine(self.metric) { normalize(query) } else { query }
   let l2 = is_l2(self.metric)
-  let lut = self.build_lut(processed, l2)
+  let lut = pq_lut(self.codebooks, self.m, self.ksub, self.dsub, processed, l2)
   let cand_n = match self.raw {
     Some(_) => if oversample > 1 { k * oversample } else { k }
     None => k
   }
   let top = TopK::new(cand_n)
   for i in 0..<self.count {
-    let mut acc : Float = 0.0
-    for j in 0..<self.m {
-      acc = acc + lut[j * self.ksub + self.codes[i * self.m + j].to_int()]
-    }
+    let acc = pq_adc_sum(lut, self.ksub, self.codes, i * self.m, self.m)
     let key = if l2 { acc } else { -acc }
     top.push(key, i)
   }
@@ -289,7 +348,7 @@ pub fn PqIndex::from_bytes(b : FixedArray[Byte]) -> PqIndex {
   let metric = metric_from_u32(read_u32_le(b, 12))
   let dim = read_u32_le(b, 16).reinterpret_as_int()
   let count = read_u32_le(b, 20).reinterpret_as_int()
-  let has_raw = read_u32_le(b, 24) != 0
+  let has_raw = (read_u32_le(b, 24) & 1) != 0
   let m = read_u32_le(b, 28).reinterpret_as_int()
   let ksub = read_u32_le(b, 32).reinterpret_as_int()
   if dim == 0 || m == 0 || dim % m != 0 {

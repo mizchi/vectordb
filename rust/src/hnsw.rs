@@ -377,6 +377,7 @@ fn normalize(v: &[f32]) -> Vec<f32> {
 
 const HNSW_MAGIC: &[u8; 8] = b"VECDBHN1";
 const HNSW_VERSION: u32 = 1;
+const HNSW_FLAG_HAS_DELETED: u32 = 1;
 
 #[inline]
 fn align16(x: usize) -> usize {
@@ -394,11 +395,21 @@ impl HnswIndex {
                 links_bytes += 4 + self.links[i][lc].len() * 4;
             }
         }
+        let has_deleted = self.deleted_count > 0;
         let vec_off = align16(64);
         let ids_off = align16(vec_off + count * dim * 4);
         let lvl_off = align16(ids_off + count * 8);
         let links_off = align16(lvl_off + count * 4);
-        let total = links_off + links_bytes;
+        let links_end = links_off + links_bytes;
+        // Optional tombstone section (1 byte/node) after the links, gated by a
+        // flag in the previously-reserved header word at offset 48. Absent when
+        // there are no deletions, so the layout stays identical to before.
+        let deleted_off = align16(links_end);
+        let total = if has_deleted {
+            deleted_off + count
+        } else {
+            links_end
+        };
 
         let mut b = vec![0u8; total];
         b[0..8].copy_from_slice(HNSW_MAGIC);
@@ -411,6 +422,14 @@ impl HnswIndex {
         b[32..36].copy_from_slice(&(self.max_level as u32).to_le_bytes());
         b[36..40].copy_from_slice(&(self.entry.unwrap_or(0)).to_le_bytes());
         b[40..48].copy_from_slice(&self.rng.to_le_bytes());
+        b[48..52].copy_from_slice(
+            &(if has_deleted {
+                HNSW_FLAG_HAS_DELETED
+            } else {
+                0
+            })
+            .to_le_bytes(),
+        );
 
         for (j, &x) in self.vectors.iter().enumerate() {
             b[vec_off + j * 4..vec_off + j * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -431,6 +450,11 @@ impl HnswIndex {
                     b[p..p + 4].copy_from_slice(&nb.to_le_bytes());
                     p += 4;
                 }
+            }
+        }
+        if has_deleted {
+            for (i, &d) in self.deleted.iter().enumerate() {
+                b[deleted_off + i] = d as u8;
             }
         }
         std::fs::write(path, &b)
@@ -507,6 +531,19 @@ impl HnswIndex {
             links.push(node_links);
         }
 
+        // Optional tombstone section after the links (flag at offset 48).
+        let (deleted, deleted_count) = if u32_at(48) & HNSW_FLAG_HAS_DELETED != 0 {
+            let doff = align16(p);
+            if b.len() < doff + count {
+                return Err(bad("tombstones truncated"));
+            }
+            let d: Vec<bool> = (0..count).map(|i| b[doff + i] != 0).collect();
+            let dc = d.iter().filter(|&&x| x).count();
+            (d, dc)
+        } else {
+            (vec![false; count], 0)
+        };
+
         Ok(HnswIndex {
             dim,
             metric,
@@ -521,8 +558,8 @@ impl HnswIndex {
             entry: if count > 0 { Some(entry_raw) } else { None },
             max_level,
             rng,
-            deleted: vec![false; count],
-            deleted_count: 0,
+            deleted,
+            deleted_count,
         })
     }
 }
@@ -633,6 +670,19 @@ mod tests {
             let q = &items[t * 13 % n].1;
             assert!(idx.search(q, 10, 64).iter().all(|h| h.id != victim));
         }
+        // Tombstones survive a save/load round-trip (before compaction).
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_hnsw_tombstone.vecdb");
+        idx.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), n);
+        assert_eq!(loaded.live_len(), n - 1);
+        for t in 0..20 {
+            let q = &items[t * 13 % n].1;
+            assert!(loaded.search(q, 10, 64).iter().all(|h| h.id != victim));
+        }
+        std::fs::remove_file(&path).ok();
+
         // Compaction rebuilds without the tombstone; results stay valid.
         idx.compact();
         assert_eq!(idx.len(), n - 1);

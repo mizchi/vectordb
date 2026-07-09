@@ -139,7 +139,7 @@ pub fn FlatIndex::from_bytes(b : FixedArray[Byte]) -> FlatIndex {
   let metric = metric_from_u32(read_u32_le(b, 12))
   let dim = read_u32_le(b, 16).reinterpret_as_int()
   let count = read_u32_le(b, 20).reinterpret_as_int()
-  let has_raw = read_u32_le(b, 24) != 0
+  let has_raw = (read_u32_le(b, 24) & 1) != 0
   let l = layout(dim, count, has_raw)
   if b.length() < l.total {
     abort("from_bytes: buffer truncated")

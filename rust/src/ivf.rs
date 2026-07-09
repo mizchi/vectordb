@@ -434,6 +434,7 @@ const IVF_MAGIC: &[u8; 8] = b"VECDBIV1";
 const IVF_VERSION: u32 = 1;
 const IVF_HEADER_LEN: usize = 64;
 const IVF_FLAG_HAS_RAW: u32 = 1;
+const IVF_FLAG_HAS_DELETED: u32 = 2;
 
 #[inline]
 fn align16(x: usize) -> usize {
@@ -448,10 +449,17 @@ struct IvfLayout {
     sqnorms: usize,
     codes: usize,
     raw: usize,
+    deleted: usize,
     total: usize,
 }
 
-fn ivf_layout(dim: usize, count: usize, nlist: usize, has_raw: bool) -> IvfLayout {
+fn ivf_layout(
+    dim: usize,
+    count: usize,
+    nlist: usize,
+    has_raw: bool,
+    has_deleted: bool,
+) -> IvfLayout {
     let centroids = align16(IVF_HEADER_LEN);
     let offsets = align16(centroids + nlist * dim * 4);
     let ids = align16(offsets + (nlist + 1) * 8);
@@ -459,10 +467,19 @@ fn ivf_layout(dim: usize, count: usize, nlist: usize, has_raw: bool) -> IvfLayou
     let sqnorms = align16(scales + count * 4);
     let codes = align16(sqnorms + count * 4);
     let raw = align16(codes + count * dim);
-    let total = if has_raw {
+    // The tombstone section (1 byte/row) follows raw, and is written only when
+    // the index carries deletions — so an index without any keeps the exact
+    // original layout.
+    let after_raw = if has_raw {
         align16(raw + count * dim * 4)
     } else {
         raw
+    };
+    let deleted = after_raw;
+    let total = if has_deleted {
+        align16(deleted + count)
+    } else {
+        after_raw
     };
     IvfLayout {
         centroids,
@@ -472,6 +489,7 @@ fn ivf_layout(dim: usize, count: usize, nlist: usize, has_raw: bool) -> IvfLayou
         sqnorms,
         codes,
         raw,
+        deleted,
         total,
     }
 }
@@ -513,7 +531,8 @@ impl IvfIndex {
         let dim = self.dim;
         let count = self.len();
         let has_raw = self.raw.is_some();
-        let l = ivf_layout(dim, count, self.nlist, has_raw);
+        let has_deleted = self.deleted_count > 0;
+        let l = ivf_layout(dim, count, self.nlist, has_raw, has_deleted);
         let mut buf = vec![0u8; l.total];
 
         buf[0..8].copy_from_slice(IVF_MAGIC);
@@ -521,7 +540,14 @@ impl IvfIndex {
         buf[12..16].copy_from_slice(&(self.metric as u32).to_le_bytes());
         buf[16..20].copy_from_slice(&(dim as u32).to_le_bytes());
         buf[20..24].copy_from_slice(&(count as u32).to_le_bytes());
-        buf[24..28].copy_from_slice(&(if has_raw { IVF_FLAG_HAS_RAW } else { 0 }).to_le_bytes());
+        let mut flags = 0;
+        if has_raw {
+            flags |= IVF_FLAG_HAS_RAW;
+        }
+        if has_deleted {
+            flags |= IVF_FLAG_HAS_DELETED;
+        }
+        buf[24..28].copy_from_slice(&flags.to_le_bytes());
         buf[28..32].copy_from_slice(&(self.nlist as u32).to_le_bytes());
 
         put_f32s(&mut buf, l.centroids, &self.centroids);
@@ -534,6 +560,11 @@ impl IvfIndex {
         }
         if let Some(raw) = &self.raw {
             put_f32s(&mut buf, l.raw, raw);
+        }
+        if has_deleted {
+            for (i, &d) in self.deleted.iter().enumerate() {
+                buf[l.deleted + i] = d as u8;
+            }
         }
 
         std::fs::write(path, &buf)
@@ -555,12 +586,14 @@ impl IvfIndex {
         let metric = Metric::from_u32(get_u32(b, 12)).ok_or_else(|| bad("bad metric"))?;
         let dim = get_u32(b, 16) as usize;
         let count = get_u32(b, 20) as usize;
-        let has_raw = get_u32(b, 24) & IVF_FLAG_HAS_RAW != 0;
+        let flags = get_u32(b, 24);
+        let has_raw = flags & IVF_FLAG_HAS_RAW != 0;
+        let has_deleted = flags & IVF_FLAG_HAS_DELETED != 0;
         let nlist = get_u32(b, 28) as usize;
         if dim == 0 || nlist == 0 {
             return Err(bad("zero dim/nlist"));
         }
-        let l = ivf_layout(dim, count, nlist, has_raw);
+        let l = ivf_layout(dim, count, nlist, has_raw, has_deleted);
         if b.len() < l.total {
             return Err(bad("file truncated"));
         }
@@ -580,6 +613,13 @@ impl IvfIndex {
         };
 
         let n = ids.len();
+        let (deleted, deleted_count) = if has_deleted {
+            let d: Vec<bool> = (0..n).map(|i| b[l.deleted + i] != 0).collect();
+            let dc = d.iter().filter(|&&x| x).count();
+            (d, dc)
+        } else {
+            (vec![false; n], 0)
+        };
         Ok(IvfIndex {
             dim,
             metric,
@@ -591,8 +631,8 @@ impl IvfIndex {
             scales,
             sqnorms,
             raw,
-            deleted: vec![false; n],
-            deleted_count: 0,
+            deleted,
+            deleted_count,
         })
     }
 }
@@ -907,6 +947,16 @@ mod tests {
             .search_parallel(q, 10, 4, 4)
             .iter()
             .all(|h| h.id != victim));
+        // Tombstones survive a save/load round-trip (before compaction).
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_ivf_tombstone.vecdb");
+        idx.save(&path).unwrap();
+        let loaded = IvfIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), n);
+        assert_eq!(loaded.live_len(), n - 1);
+        assert!(loaded.search(q, 10, 4, 4).iter().all(|h| h.id != victim));
+        std::fs::remove_file(&path).ok();
+
         // Compaction drops the tombstone; results stay consistent.
         idx.compact();
         assert_eq!(idx.len(), n - 1);

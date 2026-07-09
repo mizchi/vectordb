@@ -565,6 +565,142 @@ test "hnsw filtered search matches flat ground truth" {
 }
 
 ///|
+test "opq rotation orthonormal + rerank recall + round-trip" {
+  let dim = 16
+  let rng = Rng::{ state: 0x2718_2818_2845_9045UL }
+  // Skewed data (unbalanced per-dim scale) where a rotation helps PQ.
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<1000 {
+    let f0 = rng.unit() * 2.0 - 1.0
+    let f1 = rng.unit() * 2.0 - 1.0
+    let v = Array::make(dim, (0.0 : Float))
+    for d in 0..<dim {
+      let scale = Float::from_double((d % 4 + 1).to_double()) * 0.4
+      v[d] = (
+          f0 * Float::from_double(@math.sin(d.to_double() * 0.2)) +
+          f1 * 0.5 +
+          (rng.unit() - 0.5) * 0.1
+        ) *
+        scale
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let opq = OpqIndex::build(vectors, ids, L2, 8, 64, 12, 3, true)
+  // R Rᵀ ≈ I.
+  for i in 0..<dim {
+    for j in 0..<dim {
+      let mut s : Float = 0.0
+      for k in 0..<dim {
+        s = s + opq.rot[i * dim + k] * opq.rot[j * dim + k]
+      }
+      let expect : Float = if i == j { 1.0 } else { 0.0 }
+      assert_true((s - expect).abs() < 0.05)
+    }
+  }
+  // Rerank recall vs exact.
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<30 {
+    let q = vectors[t * 17 % 1000]
+    let got = opq.search(q, 10, 16)
+    let truth = flat.search_exact(q, 10)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  assert_true(hit.to_double() / total.to_double() >= 0.90)
+  // Round-trip.
+  let back = OpqIndex::from_bytes(opq.to_bytes())
+  assert_eq(back.length(), opq.length())
+  for t in 0..<10 {
+    let q = vectors[t * 41 % 1000]
+    let a = opq.search(q, 10, 16)
+    let b = back.search(q, 10, 16)
+    for i in 0..<a.length() {
+      assert_eq(a[i].id, b[i].id)
+    }
+  }
+}
+
+///|
+test "ivf+pq high recall with rerank" {
+  let dim = 64
+  let ncenters = 20
+  let rng = Rng::{ state: 0x3141_5926_5358_9793UL }
+  let centers : Array[Array[Float]] = []
+  for _c in 0..<ncenters {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    centers.push(v)
+  }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<3000 {
+    let c = centers[i % ncenters]
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = c[j] + (rng.unit() - 0.5) * 0.2
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let idx = IvfPqIndex::build(vectors, ids, L2, 40, 16, 64, 12, true)
+  assert_eq(idx.length(), 3000)
+  assert_true(idx.code_bytes() == 3000 * 16)
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<30 {
+    let c = centers[t % ncenters]
+    let q = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      q[j] = c[j] + 0.01
+    }
+    let got = idx.search(q, 10, 8, 16)
+    let truth = flat.search_exact(q, 10)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.90)
+}
+
+///|
+test "ivf+pq bytes round-trip" {
+  let (vectors, ids) = make_clusters()
+  let idx = IvfPqIndex::build(vectors, ids, L2, 4, 2, 8, 15, true)
+  let back = IvfPqIndex::from_bytes(idx.to_bytes())
+  assert_eq(back.length(), idx.length())
+  assert_eq(back.nlist(), idx.nlist())
+  assert_true(back.has_raw())
+  let q : Array[Float] = [10.0, 10.0]
+  let a = idx.search(q, 3, 2, 4)
+  let b = back.search(q, 3, 2, 4)
+  assert_eq(a.length(), b.length())
+  for i in 0..<a.length() {
+    assert_eq(a[i].id, b[i].id)
+  }
+}
+
+///|
 test "hnsw-q(int8) recall with rerank" {
   let n = 1500
   let dim = 24

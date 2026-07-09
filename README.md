@@ -364,22 +364,32 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、`to
 `index.mbt`（Flat + rerank）/ `ivf.mbt`（IVF: k-means++ + nprobe）/
 `hnsw.mbt`（HNSW グラフ）/ `hnsw_q.mbt`（int8 グラフ HNSW）/
 `bin_quant.mbt`（binary 1-bit）/ `rabitq.mbt`（RaBitQ: 回転 + 符号 + 不偏推定）/
-`ivf_rabitq.mbt`（IVF+RaBitQ）/ `pq.mbt`（Product Quantization）/
+`ivf_rabitq.mbt`（IVF+RaBitQ）/ `pq.mbt`（PQ + 共有プリミティブ）/
+`ivf_pq.mbt`（IVF+PQ）/ `opq.mbt`（OPQ: 学習回転 + 自作 Jacobi 固有値分解）/
 `storage.mbt`（`.vecdb` 相互運用）。
-量子化は Rust とほぼ同等（int8 / binary / RaBitQ / IVF+RaBitQ / **PQ**）を移植済み。
+量子化は Rust と同等（int8 / binary / RaBitQ / IVF+RaBitQ / **PQ / IVF+PQ / OPQ**）を移植済み。
 
-**PQ**（`VECDBPQ1`）と **int8 グラフ HNSW**（`VECDBHQ1`）も Rust 版と同設計:
+**PQ**（`VECDBPQ1`）/ **IVF+PQ**（`VECDBIP1`）/ **OPQ**（`VECDBOP1`）/
+**int8 グラフ HNSW**（`VECDBHQ1`）も Rust 版と同設計:
 
 ```moonbit
 let pq = @vectordb.PqIndex::build(vectors, ids, @vectordb.L2, 16, 256, 20, true)
 let hits = pq.search(query, 10, 16)      // (k, oversample)
-let restored = @vectordb.PqIndex::from_bytes(pq.to_bytes())
+
+let ipq = @vectordb.IvfPqIndex::build(vectors, ids, @vectordb.L2, 256, 16, 256, 15, true)
+let hits2 = ipq.search(query, 10, 16, 16)  // (k, nprobe, oversample)
+
+let opq = @vectordb.OpqIndex::build(vectors, ids, @vectordb.L2, 16, 256, 20, 4, true)
+let hits3 = opq.search(query, 10, 16)
 
 let hq = @vectordb.HnswQIndex::new(dim, @vectordb.L2, 16, 200, true)
 hq.add(1L, embedding)
-let hits = hq.search(query, 10, 96)      // int8グラフ + f32 rerank
-let restored2 = @vectordb.HnswQIndex::from_bytes(hq.to_bytes())
+let hits4 = hq.search(query, 10, 96)     // int8グラフ + f32 rerank
 ```
+
+各インデックスは `to_bytes` / `from_bytes` で round-trip でき、Rust と同じマジックの
+`.vecdb` レイアウトを共有する（k-means の乱数列が言語間で異なるため生成バイト列は
+一般に一致しないが、フォーマットは相互に読める）。
 
 HNSW も Rust 版と同設計:
 
@@ -451,8 +461,9 @@ let m = open("idx.vecdb")?;                     // mmap でも payload(1) が引
 - **IVF**: `compact()` は再クラスタリング無しでセル毎 CSR を詰め直す。
 - **HNSW**: 削除ノードは結果から除外しつつグラフ探索は通過（連結性維持）。`compact()`
   は生存ノードから**グラフを再構築**。
-- IVF / HNSW の tombstone はメモリ上のみ（形式は生存行だけを持つ）。永続化するなら
-  `save()` 前に `compact()` を呼ぶ。
+- **IVF / HNSW も tombstone を永続化**（フラグ制御の追加セクション; 削除が無ければ
+  従来と同一レイアウト）。`save`/`load` で削除状態のまま復元される。物理削除したい場合は
+  `save()` 前に `compact()`。
 
 ```rust
 idx.remove(42);            // tombstone（検索から消える。Flat/IVF/HNSW 共通）
