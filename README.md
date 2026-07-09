@@ -33,13 +33,16 @@ $V build        vecs.csv flat.vecdb --metric cosine         # Flat（int8+rerank
 $V build-ivf    vecs.csv ivf.vecdb  --metric cosine --nlist 256
 $V build-hnsw   vecs.csv hnsw.vecdb --metric cosine -m 16 --ef-construction 200
 $V build-hnsw-q vecs.csv hnswq.vecdb --metric cosine        # int8グラフHNSW（省メモリ）
-$V build-pq     vecs.csv pq.vecdb   --metric cosine --pq-m 16 --ksub 256  # Product Quantization
+$V build-pq     vecs.csv pq.vecdb    --metric cosine --pq-m 16 --ksub 256  # Product Quantization
+$V build-opq    vecs.csv opq.vecdb   --metric cosine --pq-m 16 --opq-iters 4  # 回転付きPQ
+$V build-ivfpq  vecs.csv ivfpq.vecdb --metric cosine --nlist 256 --pq-m 16    # IVF+PQ
 $V info   hnsw.vecdb
-$V search flat.vecdb query.csv -k 10 --oversample 4
-$V search ivf.vecdb  query.csv -k 10 --nprobe 16
-$V search hnsw.vecdb query.csv -k 10 --ef 64
-$V search pq.vecdb   query.csv -k 10 --oversample 8
-# 最小サイズ（rerankなし）: build / build-hnsw-q / build-pq に --compact
+$V search flat.vecdb  query.csv -k 10 --oversample 4
+$V search ivf.vecdb   query.csv -k 10 --nprobe 16
+$V search hnsw.vecdb  query.csv -k 10 --ef 64
+$V search pq.vecdb    query.csv -k 10 --oversample 8
+$V search ivfpq.vecdb query.csv -k 10 --nprobe 16 --oversample 16
+# 最小サイズ（rerankなし）: build 系の各コマンドに --compact
 ```
 
 ライブラリAPI:
@@ -204,6 +207,33 @@ let hits = pq.search(&query, 10, /*oversample=*/16);
 pq.save("index.pq.vecdb")?;                    // magic VECDBPQ1
 ```
 
+### OPQ（回転付き PQ, `opq.rs` の `OpqIndex`）
+
+PQ の前に**直交回転 `R` を学習**してサブ空間のエネルギーを均し、量子化誤差を下げる
+（Ge et al. 2013）。`R` は非パラメトリック交互最適化で学習: (1) 現在の回転でPQ学習+再構成、
+(2) 生データと再構成を整列させる直交 Procrustes 解で `R` を更新。手順(2)の SVD は依存無しの
+自作 Jacobi 固有値分解で計算。`R` は直交なので距離を保存し、検索は「クエリを回転→ADC」だけ。
+
+```rust
+use vectordb::{OpqIndex, Metric};
+let opq = OpqIndex::build(&items, Metric::L2, 16, 256, /*iters=*/20, /*opq_iters=*/4, true);
+let hits = opq.search(&query, 10, 16);
+opq.save("index.opq.vecdb")?;                  // magic VECDBOP1
+```
+
+### IVF + PQ（`ivf_pq.rs` の `IvfPqIndex`）
+
+粗い k-means でセルに割り当て、**残差 `x - 重心` を共有 PQ コードブックで量子化**（Faiss の
+`IVFPQ`）。残差は小さく中心化されているので、同じPQ予算でも生ベクトルより精度が高い。検索は
+`nprobe` セルを探索し、残差クエリで ADC → rerank。
+
+```rust
+use vectordb::{IvfPqIndex, Metric};
+let idx = IvfPqIndex::build(&items, Metric::L2, /*nlist=*/256, 16, 256, 15, true);
+let hits = idx.search(&query, 10, /*nprobe=*/16, /*oversample=*/16);
+idx.save("index.ivfpq.vecdb")?;                // magic VECDBIP1
+```
+
 ### int8 グラフ HNSW（`hnsw_q.rs` の `HnswQIndex`）
 
 HNSW と同じグラフだが、各ノードを int8 コード + per-vector scale/sqnorm で保持
@@ -227,7 +257,9 @@ idx.save("graph.hnswq.vecdb")?;                        // magic VECDBHQ1
 - `ivf.rs` — IVF（k-means + nprobe 探索）+ save/load + 並列
 - `bin_quant.rs` — binary(1-bit) 量子化 + ハミング + rerank
 - `rabitq.rs` — RaBitQ(1-bit + 回転 + 不偏推定量) + IVF+RaBitQ
-- `pq.rs` — Product Quantization（サブ空間分割 + ADC + rerank）
+- `pq.rs` — Product Quantization（サブ空間分割 + ADC + rerank; 共有プリミティブ）
+- `opq.rs` — OPQ（学習回転 + PQ; 自作 Jacobi 固有値分解）
+- `ivf_pq.rs` — IVF+PQ（粗量子化 + 残差 PQ）
 - `storage.rs` — `.vecdb` の save / mmap open / load（tombstone/payload 永続化含む）
 
 ## MoonBit（試作）
@@ -396,16 +428,22 @@ save(&idx, "idx.vecdb")?;                       // ペイロードも書き出�
 let m = open("idx.vecdb")?;                     // mmap でも payload(1) が引ける
 ```
 
-**ソフト削除（tombstone）**: `FlatIndex::remove(id)` で論理削除（検索から除外）、
-`compact()` で物理削除して領域回収。tombstone は `.vecdb` に**永続化**され、`load` /
-`open`（mmap）双方で削除状態のまま復元される（tombstone を残さず捨てたい場合は
-`compact()` 後に `save()`）。tombstone も payload も無いインデックスは従来と
-**バイト完全一致**なので MoonBit 互換は維持される。
+**ソフト削除（tombstone）**: `remove(id)` で論理削除（検索から除外）、`compact()` で
+物理削除して領域回収。**Flat / IVF / HNSW** が対応（`live_len()` で生存数）。
+
+- **Flat**: tombstone は `.vecdb` に**永続化**され、`load` / `open`（mmap）双方で削除
+  状態のまま復元。tombstone も payload も無いインデックスは従来と**バイト完全一致**
+  （MoonBit 互換維持）。
+- **IVF**: `compact()` は再クラスタリング無しでセル毎 CSR を詰め直す。
+- **HNSW**: 削除ノードは結果から除外しつつグラフ探索は通過（連結性維持）。`compact()`
+  は生存ノードから**グラフを再構築**。
+- IVF / HNSW の tombstone はメモリ上のみ（形式は生存行だけを持つ）。永続化するなら
+  `save()` 前に `compact()` を呼ぶ。
 
 ```rust
-idx.remove(42);            // tombstone（検索から消える）
+idx.remove(42);            // tombstone（検索から消える。Flat/IVF/HNSW 共通）
 idx.live_len();            // 生存件数
-idx.compact();             // 物理削除して詰める
+idx.compact();             // 物理削除して詰める（HNSW は再構築）
 ```
 
 ## 実データ評価（ANN_SIFT10K）
@@ -421,28 +459,31 @@ cargo run --release --example eval -- siftsmall
 
 | 方式 | recall@10 | ms/query | qps |
 |---|---|---|---|
-| flat exact f32 | 1.0000 | 0.19 | 5.3k |
-| flat int8+rerank (o=8) | **1.0000** | 0.17 | 6.0k |
-| binary 1-bit+rerank (o=32) | **0.0370** | 0.07 | 13.7k |
-| RaBitQ flat+rerank (o=32) | **0.9990** | 0.40 | 2.5k |
-| PQ m=16 (o=32) | **1.0000** | 0.29 | 3.4k |
-| IVF nprobe=16 (o=8) | 0.9910 | 0.059 | 16.9k |
-| IVF+RaBitQ nprobe=16 (o=32) | 0.9910 | 0.42 | 2.4k |
-| HNSW efSearch=32 | 0.9940 | 0.025 | 40.4k |
-| HNSW efSearch=128 | 1.0000 | 0.071 | 14.1k |
-| HNSW-q(int8) efSearch=64 | 0.9970 | 0.039 | 25.7k |
+| flat exact f32 | 1.0000 | 0.26 | 3.8k |
+| flat int8+rerank (o=8) | **1.0000** | 0.14 | 7.3k |
+| binary 1-bit+rerank (o=32) | **0.0370** | 0.05 | 18.8k |
+| RaBitQ flat+rerank (o=32) | **0.9990** | 0.31 | 3.2k |
+| PQ m=16 (o=32) | **1.0000** | 0.21 | 4.8k |
+| OPQ m=16 (o=32) | **1.0000** | 0.24 | 4.1k |
+| IVF nprobe=16 (o=8) | 0.9910 | 0.051 | 19.4k |
+| IVF+RaBitQ nprobe=16 (o=32) | 0.9910 | 0.29 | 3.5k |
+| IVF+PQ nprobe=16 (o=16) | 0.9910 | 0.40 | 2.5k |
+| HNSW efSearch=32 | 0.9940 | 0.031 | 31.9k |
+| HNSW efSearch=128 | 1.0000 | 0.093 | 10.8k |
+| HNSW-q(int8) efSearch=64 | 0.9970 | 0.042 | 23.9k |
 
 読み取れること（実データならでは）:
 - **int8+rerank は実データでも recall 1.0**。省メモリの安全な既定。
 - **素の binary は recall 0.037 で壊滅**。SIFT は値が非負なので符号ビットが全て 1 に
   なり情報が消える。**RaBitQ は重心を引くので 0.999** — naive binary に対する RaBitQ の
   優位が実データで明確に出る。
-- **PQ は 16 バイト/ベクトル（32x 圧縮）で rerank 併用 recall 1.0**。ADC テーブルで
-  スキャンは軽い。
-- **HNSW が最高スループット**（recall 0.994 で 40k qps、flat の ~8倍）。
-- **int8 グラフ HNSW は f32 HNSW とほぼ同 recall/qps**（0.997 で 25.7k qps）を
+- **PQ / OPQ は 16 バイト/ベクトル（32x 圧縮）で rerank 併用 recall 1.0**。ADC テーブルで
+  スキャンは軽い（SIFT は次元間バランスが良く OPQ の回転効果は小さいが、歪んだ分布では効く）。
+- **IVF+PQ は残差量子化で 16 バイト/ベクトルのまま nprobe=16 で 0.991**（大規模・省メモリ向けの定番）。
+- **HNSW が最高スループット**（recall 0.994 で 32k qps、flat の ~8倍）。
+- **int8 グラフ HNSW は f32 HNSW とほぼ同 recall/qps**（0.997 で 23.9k qps）を
   **ベクトル部 1/4 のメモリ**で達成。
-- **IVF** は recall/qps のバランスが良い（0.991 で 16.9k qps）。
+- **IVF** は recall/qps のバランスが良い（0.991 で 19.4k qps）。
 
 ## 段階的な拡張
 

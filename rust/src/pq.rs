@@ -20,6 +20,101 @@ use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::path::Path;
 
+// ---------------------------------------------------------------------------
+// Shared PQ primitives, reused by `PqIndex`, `OpqIndex`, and `IvfPqIndex`.
+// ---------------------------------------------------------------------------
+
+/// Train `m` per-subspace codebooks (each `ksub` centroids of `dim/m`) over
+/// row-major `data` (`n * dim`). Returns the `m * ksub * dsub` codebook block,
+/// laid out `[subspace][centroid][component]`. `ksub` must already be `<= n`.
+pub(crate) fn train_codebooks(
+    data: &[f32],
+    n: usize,
+    dim: usize,
+    m: usize,
+    ksub: usize,
+    iters: usize,
+) -> Vec<f32> {
+    let dsub = dim / m;
+    let mut codebooks = vec![0f32; m * ksub * dsub];
+    let mut sub = vec![0f32; n * dsub];
+    for j in 0..m {
+        for i in 0..n {
+            let src = &data[i * dim + j * dsub..i * dim + j * dsub + dsub];
+            sub[i * dsub..(i + 1) * dsub].copy_from_slice(src);
+        }
+        // renorm=false: per-subspace renormalization would distort the subvector
+        // geometry (cosine is handled by whole-vector normalization upstream).
+        let (centroids, _) = crate::ivf::kmeans(&sub, n, dsub, ksub, iters, false);
+        codebooks[j * ksub * dsub..(j + 1) * ksub * dsub].copy_from_slice(&centroids);
+    }
+    codebooks
+}
+
+/// Encode one vector into `m` PQ codes (nearest centroid per subspace by L2).
+pub(crate) fn encode_vector(
+    codebooks: &[f32],
+    dim: usize,
+    m: usize,
+    ksub: usize,
+    v: &[f32],
+    out: &mut [u8],
+) {
+    let dsub = dim / m;
+    for j in 0..m {
+        let vs = &v[j * dsub..(j + 1) * dsub];
+        let mut best = 0usize;
+        let mut best_d = f32::INFINITY;
+        for c in 0..ksub {
+            let base = (j * ksub + c) * dsub;
+            let d = l2sq_f32(vs, &codebooks[base..base + dsub]);
+            if d < best_d {
+                best_d = d;
+                best = c;
+            }
+        }
+        out[j] = best as u8;
+    }
+}
+
+/// Build an ADC lookup table for `query` against `codebooks`:
+/// `lut[j * ksub + c]` is the subspace-`j`, centroid-`c` contribution
+/// (squared-L2 when `l2`, else dot product).
+pub(crate) fn build_lut(
+    codebooks: &[f32],
+    dim: usize,
+    m: usize,
+    ksub: usize,
+    query: &[f32],
+    l2: bool,
+) -> Vec<f32> {
+    let dsub = dim / m;
+    let mut lut = vec![0f32; m * ksub];
+    for j in 0..m {
+        let qs = &query[j * dsub..(j + 1) * dsub];
+        for c in 0..ksub {
+            let base = (j * ksub + c) * dsub;
+            let cen = &codebooks[base..base + dsub];
+            lut[j * ksub + c] = if l2 {
+                l2sq_f32(qs, cen)
+            } else {
+                dot_f32(qs, cen)
+            };
+        }
+    }
+    lut
+}
+
+/// Sum an ADC table over one vector's `m` codes.
+#[inline]
+pub(crate) fn adc_sum(lut: &[f32], ksub: usize, code: &[u8]) -> f32 {
+    let mut acc = 0f32;
+    for (j, &c) in code.iter().enumerate() {
+        acc += lut[j * ksub + c as usize];
+    }
+    acc
+}
+
 /// A Product Quantization index.
 pub struct PqIndex {
     dim: usize,
@@ -77,23 +172,17 @@ impl PqIndex {
             }
         }
 
-        let mut codebooks = vec![0f32; m * ksub * dsub];
+        let codebooks = train_codebooks(&data, n, dim, m, ksub, kmeans_iters);
         let mut codes = vec![0u8; n * m];
-        // A contiguous scratch buffer for one subspace's sub-matrix.
-        let mut sub = vec![0f32; n * dsub];
-        for j in 0..m {
-            for i in 0..n {
-                let src = &data[i * dim + j * dsub..i * dim + j * dsub + dsub];
-                sub[i * dsub..(i + 1) * dsub].copy_from_slice(src);
-            }
-            // renorm=false: per-subspace renormalization would distort the
-            // subvector geometry; cosine is already handled by the whole-vector
-            // normalization above.
-            let (centroids, assign) = crate::ivf::kmeans(&sub, n, dsub, ksub, kmeans_iters, false);
-            codebooks[j * ksub * dsub..(j + 1) * ksub * dsub].copy_from_slice(&centroids);
-            for i in 0..n {
-                codes[i * m + j] = assign[i] as u8;
-            }
+        for i in 0..n {
+            encode_vector(
+                &codebooks,
+                dim,
+                m,
+                ksub,
+                &data[i * dim..(i + 1) * dim],
+                &mut codes[i * m..(i + 1) * m],
+            );
         }
 
         let raw = if keep_raw { Some(data) } else { None };
@@ -131,39 +220,10 @@ impl PqIndex {
         self.codes.len()
     }
 
-    /// The centroid for subspace `j`, code `c`.
-    #[inline]
-    fn centroid(&self, j: usize, c: usize) -> &[f32] {
-        let base = (j * self.ksub + c) * self.dsub;
-        &self.codebooks[base..base + self.dsub]
-    }
-
-    /// Build the ADC lookup table for `query`: `lut[j * ksub + c]` is the
-    /// query-subvector ↔ centroid distance contribution for subspace `j`,
-    /// centroid `c` (squared-L2 for `L2`, dot product for `Dot`/`Cosine`).
-    fn build_lut(&self, query: &[f32]) -> Vec<f32> {
-        let mut lut = vec![0f32; self.m * self.ksub];
-        for j in 0..self.m {
-            let qsub = &query[j * self.dsub..(j + 1) * self.dsub];
-            for c in 0..self.ksub {
-                let cen = self.centroid(j, c);
-                lut[j * self.ksub + c] = match self.metric {
-                    Metric::L2 => l2sq_f32(qsub, cen),
-                    Metric::Dot | Metric::Cosine => dot_f32(qsub, cen),
-                };
-            }
-        }
-        lut
-    }
-
     /// Approximate ranking key for row `i` via the ADC table (lower = better).
     #[inline]
     fn adc_key(&self, i: usize, lut: &[f32]) -> f32 {
-        let code = &self.codes[i * self.m..(i + 1) * self.m];
-        let mut acc = 0f32;
-        for (j, &c) in code.iter().enumerate() {
-            acc += lut[j * self.ksub + c as usize];
-        }
+        let acc = adc_sum(lut, self.ksub, &self.codes[i * self.m..(i + 1) * self.m]);
         // L2 accumulates squared distance (smaller better); dot accumulates
         // similarity, so negate for a "smaller = better" key.
         match self.metric {
@@ -202,7 +262,14 @@ impl PqIndex {
             return Vec::new();
         }
         let processed = self.process(query);
-        let lut = self.build_lut(&processed);
+        let lut = build_lut(
+            &self.codebooks,
+            self.dim,
+            self.m,
+            self.ksub,
+            &processed,
+            self.metric == Metric::L2,
+        );
         let cand_n = if self.raw.is_some() {
             (k * oversample.max(1)).min(self.count)
         } else {

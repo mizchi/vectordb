@@ -144,14 +144,19 @@ query(f32)
 
 ### 量子化（Rust）
 - int8 スカラ / **binary(1-bit, Hamming)** / **RaBitQ(回転+符号+不偏推定)** /
-  **IVF+RaBitQ**（セル毎重心） / **PQ(Product Quantization: サブ空間分割 + ADC + rerank)**。
+  **IVF+RaBitQ**（セル毎重心） / **PQ(サブ空間分割 + ADC + rerank)** /
+  **OPQ(学習回転 + PQ; 自作 Jacobi 固有値分解による直交 Procrustes)** /
+  **IVF+PQ(粗量子化 + 残差 PQ; Faiss IVFPQ 相当)**。
   MoonBit は int8 / binary / RaBitQ / IVF+RaBitQ。
 - **int8 グラフ HNSW**（`HnswQIndex`）: ノードを int8 で保持し f32 の約1/4メモリ。
   グラフの構築・探索とも量子化空間で行い、`keep_raw` 時のみ最終ビームを f32 で rerank。
+- PQ の共有プリミティブ（`train_codebooks` / `encode_vector` / `build_lut` / `adc_sum`）を
+  `pq.rs` に切り出し、OPQ・IVF+PQ から再利用。
 
 ### 運用機能（Rust）
-- **フィルタ付き検索**（述語, Flat/IVF/HNSW/HnswQ）、**ソフト削除 + compact**、**upsert**、
-  **バッチ挿入**（rayon 並列）、**ペイロード**（メタデータ）。
+- **フィルタ付き検索**（述語, Flat/IVF/HNSW/HnswQ）、**ソフト削除 + compact**
+  （Flat/IVF/HNSW; HNSW は再構築 compact）、**upsert**、**バッチ挿入**（rayon 並列）、
+  **ペイロード**（メタデータ）。
 - **ペイロード / tombstone の永続化**: Flat `.vecdb` にフラグ付きの追加セクション
   （削除ビット・可変長ペイロード）を持たせ、save/load・mmap 双方で復元。tombstone/
   payload が無いインデックスは従来と**バイト完全一致**（MoonBit 互換を維持）。
@@ -170,7 +175,7 @@ query(f32)
 
 ## 9. 今後の余地
 
-- IVF/HNSW の削除・更新（現状 Flat のみ tombstone 対応）。
-- MoonBit への PQ / 並列 / mmap 相当の移植。
-- OPQ（回転付き PQ）、IVF+PQ の統合、フィルタ選択率に応じた探索の適応化。
-- PQ / int8 グラフ HNSW の MoonBit 移植。
+- MoonBit への OPQ / IVF+PQ / 並列 / mmap 相当の移植。
+- IVF/HNSW tombstone の永続化（現状メモリ上のみ; Flat は永続化済み）。
+- フィルタ選択率に応じた探索の適応化、GPU/バッチ ADC の SIMD 最適化。
+- DiskANN 系のディスク常駐グラフ。

@@ -31,6 +31,8 @@ pub struct IvfIndex {
     scales: Vec<f32>, // count
     sqnorms: Vec<f32>,
     raw: Option<Vec<f32>>, // count * dim when kept
+    deleted: Vec<bool>,    // count; per-row tombstones (in-memory)
+    deleted_count: usize,
 }
 
 impl IvfIndex {
@@ -138,7 +140,70 @@ impl IvfIndex {
             scales,
             sqnorms,
             raw,
+            deleted: vec![false; n],
+            deleted_count: 0,
         }
+    }
+
+    /// Number of live (non-tombstoned) vectors.
+    pub fn live_len(&self) -> usize {
+        self.ids.len() - self.deleted_count
+    }
+
+    /// Tombstone every row with external id `id` (excluded from search). Returns
+    /// how many rows were newly deleted. Tombstones are in-memory; call
+    /// [`compact`](Self::compact) to reclaim their space (and before `save` to
+    /// persist the removal, since the `.vecdb` format carries only live rows).
+    pub fn remove(&mut self, id: u64) -> usize {
+        let mut removed = 0;
+        for i in 0..self.ids.len() {
+            if self.ids[i] == id && !self.deleted[i] {
+                self.deleted[i] = true;
+                self.deleted_count += 1;
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Physically drop tombstoned rows, rebuilding the per-cell CSR arrays.
+    /// Centroids and `nlist` are unchanged (no re-clustering).
+    pub fn compact(&mut self) {
+        if self.deleted_count == 0 {
+            return;
+        }
+        let dim = self.dim;
+        let live = self.live_len();
+        let mut ids = Vec::with_capacity(live);
+        let mut codes = Vec::with_capacity(live * dim);
+        let mut scales = Vec::with_capacity(live);
+        let mut sqnorms = Vec::with_capacity(live);
+        let mut raw = self.raw.as_ref().map(|_| Vec::with_capacity(live * dim));
+        let mut offsets = vec![0usize; self.nlist + 1];
+        for cell in 0..self.nlist {
+            for i in self.offsets[cell]..self.offsets[cell + 1] {
+                if self.deleted[i] {
+                    continue;
+                }
+                ids.push(self.ids[i]);
+                codes.extend_from_slice(&self.codes[i * dim..(i + 1) * dim]);
+                scales.push(self.scales[i]);
+                sqnorms.push(self.sqnorms[i]);
+                if let (Some(dst), Some(src)) = (raw.as_mut(), self.raw.as_ref()) {
+                    dst.extend_from_slice(&src[i * dim..(i + 1) * dim]);
+                }
+            }
+            offsets[cell + 1] = ids.len();
+        }
+        let n = ids.len();
+        self.ids = ids;
+        self.codes = codes;
+        self.scales = scales;
+        self.sqnorms = sqnorms;
+        self.raw = raw;
+        self.offsets = offsets;
+        self.deleted = vec![false; n];
+        self.deleted_count = 0;
     }
 
     /// Search the `nprobe` nearest cells for the `k` nearest neighbors.
@@ -164,7 +229,7 @@ impl IvfIndex {
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for &cell in &cells {
             for i in self.offsets[cell]..self.offsets[cell + 1] {
-                if !filter(self.ids[i]) {
+                if self.deleted[i] || !filter(self.ids[i]) {
                     continue;
                 }
                 push_bounded(
@@ -200,6 +265,7 @@ impl IvfIndex {
         let cand: Vec<usize> = cells
             .iter()
             .flat_map(|&c| self.offsets[c]..self.offsets[c + 1])
+            .filter(|&i| !self.deleted[i])
             .collect();
 
         let heap = if cand.len() < IVF_PAR_THRESHOLD {
@@ -513,6 +579,7 @@ impl IvfIndex {
             None
         };
 
+        let n = ids.len();
         Ok(IvfIndex {
             dim,
             metric,
@@ -524,6 +591,8 @@ impl IvfIndex {
             scales,
             sqnorms,
             raw,
+            deleted: vec![false; n],
+            deleted_count: 0,
         })
     }
 }
@@ -819,5 +888,29 @@ mod tests {
         let idx = IvfIndex::build(2, Metric::Cosine, 4, &items, true, 10);
         let hits = idx.search(&[10.0, 10.0], 5, 4, 4);
         assert_eq!(hits.len(), 5);
+    }
+
+    #[test]
+    fn ivf_soft_delete_and_compact() {
+        let items = make_items();
+        let n = items.len();
+        let mut idx = IvfIndex::build(2, Metric::L2, 4, &items, true, 15);
+        // Delete a specific id and confirm it never comes back.
+        let victim = items[0].0;
+        assert_eq!(idx.remove(victim), 1);
+        assert_eq!(idx.remove(victim), 0); // already gone
+        assert_eq!(idx.live_len(), n - 1);
+        let q = &items[0].1;
+        assert!(idx.search(q, 10, 4, 4).iter().all(|h| h.id != victim));
+        #[cfg(feature = "parallel")]
+        assert!(idx
+            .search_parallel(q, 10, 4, 4)
+            .iter()
+            .all(|h| h.id != victim));
+        // Compaction drops the tombstone; results stay consistent.
+        idx.compact();
+        assert_eq!(idx.len(), n - 1);
+        assert_eq!(idx.live_len(), n - 1);
+        assert!(idx.search(q, 10, 4, 4).iter().all(|h| h.id != victim));
     }
 }

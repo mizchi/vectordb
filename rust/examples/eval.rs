@@ -12,8 +12,8 @@
 use std::path::Path;
 use std::time::Instant;
 use vectordb::{
-    BinaryIndex, FlatIndex, HnswIndex, HnswQIndex, IvfIndex, IvfRabitqIndex, Metric, PqIndex,
-    RabitqIndex,
+    BinaryIndex, FlatIndex, HnswIndex, HnswQIndex, IvfIndex, IvfPqIndex, IvfRabitqIndex, Metric,
+    OpqIndex, PqIndex, RabitqIndex,
 };
 
 type SearchFn<'a> = Box<dyn FnMut(&[f32]) -> Vec<vectordb::Hit> + 'a>;
@@ -160,6 +160,26 @@ fn main() {
         eval(
             &format!("PQ m=16 (o={over})"),
             Box::new(move |q| p.search(q, k, over)),
+        );
+    }
+
+    // OPQ (learned rotation + PQ, same 16 bytes/vector).
+    let opq = OpqIndex::build(&items, Metric::L2, 16, 256, 20, 4, true);
+    for &over in &[8usize, 32] {
+        let o = &opq;
+        eval(
+            &format!("OPQ m=16 (o={over})"),
+            Box::new(move |q| o.search(q, k, over)),
+        );
+    }
+
+    // IVF+PQ (coarse cells + residual PQ codes).
+    let ivfpq = IvfPqIndex::build(&items, Metric::L2, 100, 16, 256, 15, true);
+    for &np in &[8usize, 16] {
+        let i = &ivfpq;
+        eval(
+            &format!("IVF+PQ nprobe={np} (o=16)"),
+            Box::new(move |q| i.search(q, k, np, 16)),
         );
     }
 

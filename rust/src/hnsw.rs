@@ -50,6 +50,8 @@ pub struct HnswIndex {
     entry: Option<u32>,
     max_level: usize,
     rng: u64,
+    deleted: Vec<bool>, // per-node tombstones (in-memory)
+    deleted_count: usize,
 }
 
 impl HnswIndex {
@@ -70,6 +72,8 @@ impl HnswIndex {
             entry: None,
             max_level: 0,
             rng: 0x9E37_79B9_7F4A_7C15,
+            deleted: Vec::new(),
+            deleted_count: 0,
         }
     }
 
@@ -84,6 +88,43 @@ impl HnswIndex {
     }
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+    /// Number of live (non-tombstoned) vectors.
+    pub fn live_len(&self) -> usize {
+        self.ids.len() - self.deleted_count
+    }
+
+    /// Tombstone every node with external id `id`; it is excluded from search
+    /// results (the graph is still traversed through it, so connectivity is
+    /// preserved). Tombstones are in-memory — call [`compact`](Self::compact)
+    /// to rebuild the graph without them (and before `save` to persist the
+    /// removal). Returns how many nodes were newly deleted.
+    pub fn remove(&mut self, id: u64) -> usize {
+        let mut removed = 0;
+        for i in 0..self.ids.len() {
+            if self.ids[i] == id && !self.deleted[i] {
+                self.deleted[i] = true;
+                self.deleted_count += 1;
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Rebuild the graph from the live nodes only, physically dropping
+    /// tombstoned ones. This re-inserts every survivor, so it is O(n log n).
+    pub fn compact(&mut self) {
+        if self.deleted_count == 0 {
+            return;
+        }
+        let mut rebuilt = HnswIndex::new(self.dim, self.metric, self.m, self.ef_construction);
+        for i in 0..self.ids.len() {
+            if !self.deleted[i] {
+                let v = self.vec_at(i as u32).to_vec();
+                rebuilt.add(self.ids[i], &v);
+            }
+        }
+        *self = rebuilt;
     }
 
     fn next_rand(&mut self) -> f64 {
@@ -128,6 +169,7 @@ impl HnswIndex {
         self.ids.push(id);
         self.levels.push(level);
         self.links.push((0..=level).map(|_| Vec::new()).collect());
+        self.deleted.push(false);
 
         let Some(mut ep) = self.entry else {
             self.entry = Some(node);
@@ -205,7 +247,7 @@ impl HnswIndex {
             let dist = self.d(self.vec_at(e), q);
             visited[e as usize] = true;
             cands.push(Reverse(DN { dist, node: e }));
-            if filter(self.ids[e as usize]) {
+            if !self.deleted[e as usize] && filter(self.ids[e as usize]) {
                 w.push(DN { dist, node: e });
             }
         }
@@ -223,7 +265,7 @@ impl HnswIndex {
                 let farthest = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || w.len() < ef {
                     cands.push(Reverse(DN { dist: d, node: nb }));
-                    if filter(self.ids[nb as usize]) {
+                    if !self.deleted[nb as usize] && filter(self.ids[nb as usize]) {
                         w.push(DN { dist: d, node: nb });
                         if w.len() > ef {
                             w.pop();
@@ -479,6 +521,8 @@ impl HnswIndex {
             entry: if count > 0 { Some(entry_raw) } else { None },
             max_level,
             rng,
+            deleted: vec![false; count],
+            deleted_count: 0,
         })
     }
 }
@@ -573,6 +617,47 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn hnsw_soft_delete_and_compact() {
+        let (mut idx, items) = build(Metric::L2);
+        let n = items.len();
+        // Remove the exact nearest neighbor of several queries and confirm it
+        // never appears; a live neighbor should take its place.
+        let victim = items[7].0;
+        assert_eq!(idx.remove(victim), 1);
+        assert_eq!(idx.remove(victim), 0);
+        assert_eq!(idx.live_len(), n - 1);
+        for t in 0..20 {
+            let q = &items[t * 13 % n].1;
+            assert!(idx.search(q, 10, 64).iter().all(|h| h.id != victim));
+        }
+        // Compaction rebuilds without the tombstone; results stay valid.
+        idx.compact();
+        assert_eq!(idx.len(), n - 1);
+        assert_eq!(idx.live_len(), n - 1);
+        // Recall of the compacted graph is still high vs exact over live set.
+        let mut flat = crate::FlatIndex::new(32, Metric::L2, true);
+        for (id, v) in &items {
+            if *id != victim {
+                flat.add(*id, v);
+            }
+        }
+        let mut hit = 0;
+        let mut total = 0;
+        for t in 0..30 {
+            let q = &items[t * 11 % n].1;
+            let truth: std::collections::HashSet<u64> =
+                flat.search_exact(q, 10).iter().map(|h| h.id).collect();
+            hit += idx
+                .search(q, 10, 64)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
+            total += truth.len();
+        }
+        assert!(hit as f64 / total as f64 >= 0.90);
     }
 
     #[test]
