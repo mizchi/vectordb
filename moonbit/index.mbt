@@ -261,11 +261,27 @@ pub fn FlatIndex::search(
   k : Int,
   oversample : Int,
 ) -> Array[Hit] {
+  self.search_filter(query, k, oversample, fn(_id) { true })
+}
+
+///|
+/// Like `search`, but only rows whose id satisfies `filter` are eligible. The
+/// scan still visits every vector; non-matching ids are simply skipped before
+/// entering the candidate heap, so recall of the filtered subset is exact for
+/// the int8 stage. Useful for metadata-restricted queries (mirror of the Rust
+/// `search_filter`).
+pub fn FlatIndex::search_filter(
+  self : FlatIndex,
+  query : Array[Float],
+  k : Int,
+  oversample : Int,
+  filter : (Int64) -> Bool,
+) -> Array[Hit] {
   if k <= 0 || self.count == 0 {
     return []
   }
   if query.length() != self.dim {
-    abort("FlatIndex::search: dimension mismatch")
+    abort("FlatIndex::search_filter: dimension mismatch")
   }
   let dim = self.dim
   let count = self.count
@@ -291,6 +307,9 @@ pub fn FlatIndex::search(
   let scales = self.scales
   let sqnorms = self.sqnorms
   for i in 0..<count {
+    if !filter(self.ids[i]) {
+      continue
+    }
     let dp = dot_i8(codes, i * dim, qcodes, 0, dim)
     let approx_dot = Float::from_double(dp.to_double()) * scales[i] * qscale
     let key = if l2 { sqnorms[i] + qsq - 2.0 * approx_dot } else { -approx_dot }
@@ -358,7 +377,11 @@ fn exact_key(
 ///|
 /// Take the first `k` sorted candidates as hits, converting the internal
 /// ranking key back into the reported metric score.
-fn FlatIndex::emit(self : FlatIndex, sorted : Array[Cand], k : Int) -> Array[Hit] {
+fn FlatIndex::emit(
+  self : FlatIndex,
+  sorted : Array[Cand],
+  k : Int,
+) -> Array[Hit] {
   let hib = higher_is_better(self.metric)
   let n = min(k, sorted.length())
   let out : Array[Hit] = []

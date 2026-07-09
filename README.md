@@ -325,6 +325,19 @@ IVF 形式は Rust と**相互に読める**（同じ `VECDBIV1` レイアウト
 （どちらが書いたファイルも相手の `from_bytes`/`load` で正しく読める）。バイト単位で
 完全一致するのは決定的な Flat 形式のほう。
 
+**フィルタ付き検索**も Rust と同等に Flat / IVF / HNSW で使える。述語
+`(Int64) -> Bool` を渡すと、条件を満たす id だけが結果に入る:
+
+```moonbit
+let hits = flat.search_filter(query, 10, 4, fn(id) { id % 2L == 0L })
+let hits = ivf.search_filter(query, 10, 16, 4, fn(id) { id % 3L == 0L })
+let hits = hnsw.search_filter(query, 10, 128, fn(id) { id < 1000L })
+```
+
+Flat/IVF は候補ヒープに入れる前に非該当 id をスキップ、HNSW はグラフ探索は続けつつ
+結果ビーム `w` への採用だけを述語で絞る（選択率が低い場合は `ef_search` を大きめに）。
+`search` は常に true の述語で `search_filter` に委譲している。
+
 ## フィルタ付き検索・削除
 
 **メタデータフィルタ**: 述語 `Fn(u64) -> bool` を渡すと、条件を満たす id だけを候補に

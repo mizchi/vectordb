@@ -70,7 +70,8 @@ fn kmeanspp_init(
   nlist : Int,
 ) -> Array[Array[Float]] {
   let n = data.length()
-  let mut rng : UInt64 = 0x9E3779B97F4A7C15UL ^ n.to_int64().reinterpret_as_uint64()
+  let mut rng : UInt64 = 0x9E3779B97F4A7C15UL ^
+    n.to_int64().reinterpret_as_uint64()
   let next = fn() -> UInt64 {
     let mut x = rng
     x = x ^ (x << 13)
@@ -326,11 +327,27 @@ pub fn IvfIndex::search(
   nprobe : Int,
   oversample : Int,
 ) -> Array[Hit] {
+  self.search_filter(query, k, nprobe, oversample, fn(_id) { true })
+}
+
+///|
+/// Like `search`, but only rows whose id satisfies `filter` are eligible. The
+/// probed cells are chosen as usual; within each cell, non-matching ids are
+/// skipped before entering the candidate heap (mirror of the Rust
+/// `search_filter`).
+pub fn IvfIndex::search_filter(
+  self : IvfIndex,
+  query : Array[Float],
+  k : Int,
+  nprobe : Int,
+  oversample : Int,
+  filter : (Int64) -> Bool,
+) -> Array[Hit] {
   if k <= 0 || self.count == 0 {
     return []
   }
   if query.length() != self.dim {
-    abort("IvfIndex::search: dimension mismatch")
+    abort("IvfIndex::search_filter: dimension mismatch")
   }
   let dim = self.dim
   let l2 = is_l2(self.metric)
@@ -353,9 +370,16 @@ pub fn IvfIndex::search(
   for ci in 0..<cells.length() {
     let cell = cells[ci]
     for i in self.offsets[cell]..<self.offsets[cell + 1] {
+      if !filter(self.ids[i]) {
+        continue
+      }
       let dp = dot_i8(self.codes, i * dim, q.codes, 0, dim)
       let approx = Float::from_double(dp.to_double()) * self.scales[i] * q.scale
-      let key = if l2 { self.sqnorms[i] + q.sqnorm - 2.0 * approx } else { -approx }
+      let key = if l2 {
+        self.sqnorms[i] + q.sqnorm - 2.0 * approx
+      } else {
+        -approx
+      }
       top.push(key, i)
     }
   }
@@ -446,7 +470,9 @@ pub fn IvfIndex::to_bytes(self : IvfIndex) -> FixedArray[Byte] {
   let l = ivf_layout(dim, count, nlist, has_raw)
   let b : FixedArray[Byte] = FixedArray::make(l.total, 0)
 
-  let magic : FixedArray[Byte] = [0x56, 0x45, 0x43, 0x44, 0x42, 0x49, 0x56, 0x31]
+  let magic : FixedArray[Byte] = [
+    0x56, 0x45, 0x43, 0x44, 0x42, 0x49, 0x56, 0x31,
+  ]
   for i in 0..<8 {
     b[i] = magic[i]
   }
@@ -464,7 +490,11 @@ pub fn IvfIndex::to_bytes(self : IvfIndex) -> FixedArray[Byte] {
     }
   }
   for i in 0..<(nlist + 1) {
-    write_u64_le(b, l.offsets + i * 8, self.offsets[i].to_int64().reinterpret_as_uint64())
+    write_u64_le(
+      b,
+      l.offsets + i * 8,
+      self.offsets[i].to_int64().reinterpret_as_uint64(),
+    )
   }
   for i in 0..<count {
     write_u64_le(b, l.ids + i * 8, self.ids[i].reinterpret_as_uint64())
@@ -517,7 +547,9 @@ pub fn IvfIndex::from_bytes(b : FixedArray[Byte]) -> IvfIndex {
   }
   let offsets = Array::make(nlist + 1, 0)
   for i in 0..<(nlist + 1) {
-    offsets[i] = read_u64_le(b, l.offsets + i * 8).reinterpret_as_int64().to_int()
+    offsets[i] = read_u64_le(b, l.offsets + i * 8)
+      .reinterpret_as_int64()
+      .to_int()
   }
   let ids = Array::make(count, (0 : Int64))
   let scales = Array::make(count, (0.0 : Float))

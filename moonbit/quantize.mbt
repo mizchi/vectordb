@@ -51,13 +51,7 @@ pub fn quantize(x : Array[Float]) -> Quantized {
   let codes : FixedArray[Byte] = FixedArray::make(dim, 0)
   for i in 0..<dim {
     let q = round_f(x[i] * inv)
-    let qc = if q > 127 {
-      127
-    } else if q < -127 {
-      -127
-    } else {
-      q
-    }
+    let qc = if q > 127 { 127 } else if q < -127 { -127 } else { q }
     codes[i] = to_i8_byte(qc)
   }
   { codes, scale, sqnorm }

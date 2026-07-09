@@ -93,7 +93,12 @@ pub fn BinaryIndex::code_bytes(self : BinaryIndex) -> Int {
 }
 
 ///|
-fn hamming(a : Array[UInt64], a_off : Int, b : Array[UInt64], words : Int) -> Int {
+fn hamming(
+  a : Array[UInt64],
+  a_off : Int,
+  b : Array[UInt64],
+  words : Int,
+) -> Int {
   let mut d = 0
   for w in 0..<words {
     d = d + (a[a_off + w] ^ b[w]).popcnt()

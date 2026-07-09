@@ -112,7 +112,11 @@ pub fn HnswIndex::new(
     metric,
     m,
     m0: m * 2,
-    ef_construction: if ef_construction < m { m } else { ef_construction },
+    ef_construction: if ef_construction < m {
+      m
+    } else {
+      ef_construction
+    },
     ml: 1.0 / @math.ln(m.to_double()),
     count: 0,
     vectors: [],
@@ -185,12 +189,16 @@ fn HnswIndex::greedy1(
 
 ///|
 /// Beam search within one layer; returns the ef nearest as (dist, node) pairs.
+/// `filter(id)` gates admission into the result beam `w`; non-passing nodes are
+/// still traversed (the graph stays navigable), they just never become results.
+/// Build passes an always-true filter.
 fn HnswIndex::search_layer(
   self : HnswIndex,
   q : Array[Float],
   ep : Int,
   ef : Int,
   lc : Int,
+  filter : (Int64) -> Bool,
 ) -> Array[(Float, Int)] {
   let visited = Array::make(self.count, false)
   let cands = MinHeap::new()
@@ -198,7 +206,9 @@ fn HnswIndex::search_layer(
   let d0 = self.d(self.vectors[ep], q)
   visited[ep] = true
   cands.push(d0, ep)
-  w.push(d0, ep)
+  if filter(self.ids[ep]) {
+    w.push(d0, ep)
+  }
   while cands.len() > 0 {
     let (cd, cn) = cands.pop_min()
     let farthest = if w.size >= ef { w.keys[0] } else { 3.0e38 }
@@ -214,7 +224,9 @@ fn HnswIndex::search_layer(
       let far = if w.size >= ef { w.keys[0] } else { 3.0e38 }
       if dd < far || w.size < ef {
         cands.push(dd, nb)
-        w.push(dd, nb) // TopK keeps the ef smallest automatically
+        if filter(self.ids[nb]) {
+          w.push(dd, nb) // TopK keeps the ef smallest automatically
+        }
       }
     }
   }
@@ -255,7 +267,12 @@ fn HnswIndex::select_neighbors(
 }
 
 ///|
-fn HnswIndex::prune(self : HnswIndex, node : Int, lc : Int, budget : Int) -> Unit {
+fn HnswIndex::prune(
+  self : HnswIndex,
+  node : Int,
+  lc : Int,
+  budget : Int,
+) -> Unit {
   let q = self.vectors[node]
   let w : Array[(Float, Int)] = []
   for nb in self.links[node][lc] {
@@ -266,7 +283,11 @@ fn HnswIndex::prune(self : HnswIndex, node : Int, lc : Int, budget : Int) -> Uni
 
 ///|
 /// Insert a vector with an external id.
-pub fn HnswIndex::add(self : HnswIndex, id : Int64, vector : Array[Float]) -> Unit {
+pub fn HnswIndex::add(
+  self : HnswIndex,
+  id : Int64,
+  vector : Array[Float],
+) -> Unit {
   if vector.length() != self.dim {
     abort("HnswIndex::add: dimension mismatch")
   }
@@ -304,7 +325,11 @@ pub fn HnswIndex::add(self : HnswIndex, id : Int64, vector : Array[Float]) -> Un
   let start = if level < top { level } else { top }
   let mut l2c = start
   while l2c >= 0 {
-    let w = self.search_layer(processed, ep, self.ef_construction, l2c)
+    let w = self.search_layer(processed, ep, self.ef_construction, l2c, fn(
+      _id,
+    ) {
+      true
+    })
     // nearest candidate becomes the entry point for the next layer down
     let mut best = ep
     let mut best_d : Float = 3.0e38
@@ -341,11 +366,26 @@ pub fn HnswIndex::search(
   k : Int,
   ef_search : Int,
 ) -> Array[Hit] {
+  self.search_filter(query, k, ef_search, fn(_id) { true })
+}
+
+///|
+/// Filtered search: only ids satisfying `filter` become results. The graph is
+/// still traversed through non-passing nodes to stay navigable, so use a larger
+/// `ef_search` when the filter is very selective (mirror of the Rust
+/// `search_filter`).
+pub fn HnswIndex::search_filter(
+  self : HnswIndex,
+  query : Array[Float],
+  k : Int,
+  ef_search : Int,
+  filter : (Int64) -> Bool,
+) -> Array[Hit] {
   if k <= 0 || self.count == 0 {
     return []
   }
   if query.length() != self.dim {
-    abort("HnswIndex::search: dimension mismatch")
+    abort("HnswIndex::search_filter: dimension mismatch")
   }
   let processed = if is_cosine(self.metric) { normalize(query) } else { query }
   let mut ep = self.entry
@@ -358,7 +398,7 @@ pub fn HnswIndex::search(
     lc = lc - 1
   }
   let ef = if ef_search > k { ef_search } else { k }
-  let w = self.search_layer(processed, ep, ef, 0)
+  let w = self.search_layer(processed, ep, ef, 0, filter)
   w.sort_by(fn(a, b) { cmp_float(a.0, b.0) })
   let hib = higher_is_better(self.metric)
   let out : Array[Hit] = []
@@ -395,7 +435,9 @@ pub fn HnswIndex::to_bytes(self : HnswIndex) -> FixedArray[Byte] {
   let total = links_off + links_bytes
   let b : FixedArray[Byte] = FixedArray::make(total, 0)
 
-  let magic : FixedArray[Byte] = [0x56, 0x45, 0x43, 0x44, 0x42, 0x48, 0x4E, 0x31]
+  let magic : FixedArray[Byte] = [
+    0x56, 0x45, 0x43, 0x44, 0x42, 0x48, 0x4E, 0x31,
+  ]
   for i in 0..<8 {
     b[i] = magic[i]
   }
@@ -498,7 +540,11 @@ pub fn HnswIndex::from_bytes(b : FixedArray[Byte]) -> HnswIndex {
     ids,
     links,
     levels,
-    entry: if count > 0 { entry_raw } else { -1 },
+    entry: if count > 0 {
+      entry_raw
+    } else {
+      -1
+    },
     max_level,
     rng,
   }

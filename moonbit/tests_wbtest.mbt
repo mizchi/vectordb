@@ -199,7 +199,10 @@ test "vecdb bytes round-trip (with raw)" {
 
 ///|
 test "vecdb bytes round-trip (compact, no raw)" {
-  let vectors : Array[Array[Float]] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+  let vectors : Array[Array[Float]] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+  ]
   let ids : Array[Int64] = [7L, 8L]
   let idx = FlatIndex::build(vectors, ids, Cosine, false)
   let back = FlatIndex::from_bytes(idx.to_bytes())
@@ -486,6 +489,79 @@ test "rabitq l2 finds self" {
   let rq = RaBitqIndex::build(vectors, ids, L2, true, 3UL)
   let hits = rq.search(vectors[5], 1, 16)
   assert_eq(hits[0].id, 5L)
+}
+
+///|
+test "flat filtered search restricts to matching ids" {
+  let (vectors, ids) = make_clusters()
+  let idx = FlatIndex::build(vectors, ids, L2, true)
+  // Only even ids are eligible.
+  let filter = fn(id : Int64) -> Bool { id % 2L == 0L }
+  let hits = idx.search_filter([10.0, 10.0], 5, 4, filter)
+  assert_eq(hits.length(), 5)
+  for h in hits {
+    assert_true(h.id % 2L == 0L)
+    assert_true(h.id >= 75L) // still the nearest (4th) cluster
+  }
+}
+
+///|
+test "ivf filtered search restricts to matching ids" {
+  let (vectors, ids) = make_clusters()
+  let idx = IvfIndex::build(vectors, ids, L2, 4, true, 20)
+  let filter = fn(id : Int64) -> Bool { id % 3L == 0L }
+  // nprobe = nlist so every cell is scanned; result must respect the filter.
+  let hits = idx.search_filter([10.0, 10.0], 4, 4, 8, filter)
+  assert_eq(hits.length(), 4)
+  for h in hits {
+    assert_true(h.id % 3L == 0L)
+  }
+}
+
+///|
+test "hnsw filtered search matches flat ground truth" {
+  let n = 1500
+  let dim = 24
+  let rng = Rng::{ state: 0x0F1E2D3C4B5A6978UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<n {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let hnsw = HnswIndex::new(dim, L2, 16, 200)
+  for i in 0..<n {
+    hnsw.add(ids[i], vectors[i])
+  }
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let filter = fn(id : Int64) -> Bool { id % 3L == 0L }
+  let k = 10
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<30 {
+    let q = vectors[t * 17 % n]
+    let got = hnsw.search_filter(q, k, 128, filter)
+    // Every result respects the predicate.
+    for g in got {
+      assert_true(g.id % 3L == 0L)
+    }
+    let truth = flat.search_filter(q, k, 8, filter)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.90)
 }
 
 ///|

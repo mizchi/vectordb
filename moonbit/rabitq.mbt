@@ -26,7 +26,12 @@ pub struct RaBitqIndex {
 }
 
 ///|
-fn rq_matvec(m : Array[Float], v : Array[Float], out : Array[Float], d : Int) -> Unit {
+fn rq_matvec(
+  m : Array[Float],
+  v : Array[Float],
+  out : Array[Float],
+  d : Int,
+) -> Unit {
   for i in 0..<d {
     let base = i * d
     let mut s : Float = 0.0
@@ -51,7 +56,8 @@ fn random_rotation(d : Int, seed : UInt64) -> Array[Float] {
     x
   }
   let unit = fn() -> Double {
-    let u = (next() >> 11).reinterpret_as_int64().to_double() / 9007199254740992.0
+    let u = (next() >> 11).reinterpret_as_int64().to_double() /
+      9007199254740992.0
     if u < 1.0e-7 {
       1.0e-7
     } else if u > 1.0 - 1.0e-7 {
@@ -63,7 +69,9 @@ fn random_rotation(d : Int, seed : UInt64) -> Array[Float] {
   let gauss = fn() -> Float {
     let u1 = unit()
     let u2 = unit()
-    Float::from_double((-2.0 * @math.ln(u1)).sqrt() * @math.cos(6.283185307179586 * u2))
+    Float::from_double(
+      (-2.0 * @math.ln(u1)).sqrt() * @math.cos(6.283185307179586 * u2),
+    )
   }
   let m = Array::make(d * d, (0.0 : Float))
   for i in 0..<(d * d) {
@@ -259,7 +267,11 @@ fn QQuery::estimate(
     inner = inner + (pc << t)
   }
   self.delta * (2.0 * Float::from_double(inner.to_double()) - self.total_qu) +
-  self.vl * (2.0 * Float::from_double(popcnt.to_double()) - Float::from_double(self.dim.to_double()))
+  self.vl *
+  (
+    2.0 * Float::from_double(popcnt.to_double()) -
+    Float::from_double(self.dim.to_double())
+  )
 }
 
 ///|

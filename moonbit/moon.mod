@@ -9,4 +9,5 @@ description = "Compact vector search: flat + int8 scalar quantization + rerank, 
 // Default to the wasm backend: it is the only target where the core v128
 // intrinsics are lowered to real hardware SIMD (WASM SIMD). The code also
 // compiles and runs on native/wasm-gc/js via scalar fallbacks.
+
 preferred_target = "wasm"

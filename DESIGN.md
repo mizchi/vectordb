@@ -143,6 +143,7 @@ query(f32)
 ### 運用機能（Rust）
 - **フィルタ付き検索**（述語, Flat/IVF/HNSW）、**ソフト削除 + compact**、**upsert**、
   **バッチ挿入**（rayon 並列）、**ペイロード**（メタデータ、in-memory）。
+- MoonBit も **フィルタ付き検索**（述語, Flat/IVF/HNSW）を移植済み。
 - **rayon 並列**（クエリ内/バッチ）、**mmap 永続化**。
 - 全索引が `.vecdb` 系フォーマットで **save/load**（Flat=`VECDB1`, IVF=`VECDBIV1`,
   HNSW=`VECDBHN1`）。CLI `vecdb` から build/search/info（種別自動判定）。

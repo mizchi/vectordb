@@ -10,7 +10,7 @@
 
 ///|
 fn align16(x : Int) -> Int {
-  (x + 15) & (0xFFFFFFF0)
+  (x + 15) & 0xFFFFFFF0
 }
 
 ///|
@@ -94,7 +94,9 @@ pub fn FlatIndex::to_bytes(self : FlatIndex) -> FixedArray[Byte] {
   let b : FixedArray[Byte] = FixedArray::make(l.total, 0)
 
   // Header. magic = "VECDB1\0\0"
-  let magic : FixedArray[Byte] = [0x56, 0x45, 0x43, 0x44, 0x42, 0x31, 0x00, 0x00]
+  let magic : FixedArray[Byte] = [
+    0x56, 0x45, 0x43, 0x44, 0x42, 0x31, 0x00, 0x00,
+  ]
   for i in 0..<8 {
     b[i] = magic[i]
   }
