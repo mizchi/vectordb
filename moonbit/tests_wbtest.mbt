@@ -565,6 +565,183 @@ test "hnsw filtered search matches flat ground truth" {
 }
 
 ///|
+test "hnsw-q(int8) recall with rerank" {
+  let n = 1500
+  let dim = 24
+  let rng = Rng::{ state: 0x0A1B_2C3D_4E5F_6071UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<n {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let hq = HnswQIndex::new(dim, L2, 16, 200, true)
+  for i in 0..<n {
+    hq.add(ids[i], vectors[i])
+  }
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let k = 10
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<40 {
+    let q = vectors[t * 13 % n]
+    let got = hq.search(q, k, 96)
+    let truth = flat.search_exact(q, k)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.90)
+}
+
+///|
+test "hnsw-q(int8) filtered + bytes round-trip" {
+  let n = 600
+  let dim = 16
+  let rng = Rng::{ state: 0x7788_99AA_BBCC_DDEEUL }
+  let hq = HnswQIndex::new(dim, L2, 16, 100, true)
+  let queries : Array[Array[Float]] = []
+  for i in 0..<n {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    hq.add(i.to_int64(), v)
+    if i < 15 {
+      queries.push(v)
+    }
+  }
+  // Filtered search respects the predicate.
+  let got = hq.search_filter(queries[0], 10, 128, fn(id) { id % 3L == 0L })
+  for g in got {
+    assert_true(g.id % 3L == 0L)
+  }
+  // Round-trip returns identical results.
+  let back = HnswQIndex::from_bytes(hq.to_bytes())
+  assert_eq(back.length(), hq.length())
+  for q in queries {
+    let a = hq.search(q, 10, 64)
+    let b = back.search(q, 10, 64)
+    assert_eq(a.length(), b.length())
+    for i in 0..<a.length() {
+      assert_eq(a[i].id, b[i].id)
+    }
+  }
+}
+
+///|
+test "pq rerank high recall vs exact" {
+  let dim = 64
+  let ncenters = 20
+  let rng = Rng::{ state: 0x1357_9BDF_2468_ACE0UL }
+  let centers : Array[Array[Float]] = []
+  for _c in 0..<ncenters {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    centers.push(v)
+  }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<2000 {
+    let c = centers[i % ncenters]
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = c[j] + (rng.unit() - 0.5) * 0.2
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let pq = PqIndex::build(vectors, ids, L2, 16, 64, 15, true)
+  assert_true(pq.code_bytes() == 2000 * 16) // 16 bytes/vector
+  let flat = FlatIndex::build(vectors, ids, L2, true)
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<30 {
+    let c = centers[t % ncenters]
+    let q = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      q[j] = c[j] + 0.01
+    }
+    let got = pq.search(q, 10, 16)
+    let truth = flat.search_exact(q, 10)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.90)
+}
+
+///|
+test "pq cosine finds self" {
+  let dim = 32
+  let rng = Rng::{ state: 0x2468_ACE0_1357_9BDFUL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<300 {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let pq = PqIndex::build(vectors, ids, Cosine, 8, 64, 20, true)
+  for t in 0..<20 {
+    let i = t * 13 % 300
+    let hits = pq.search(vectors[i], 1, 8)
+    assert_eq(hits[0].id, ids[i])
+  }
+}
+
+///|
+test "pq bytes round-trip" {
+  let dim = 32
+  let rng = Rng::{ state: 0xFEDC_BA98_7654_3210UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<200 {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let pq = PqIndex::build(vectors, ids, L2, 8, 32, 12, true)
+  let back = PqIndex::from_bytes(pq.to_bytes())
+  assert_eq(back.length(), pq.length())
+  assert_true(back.has_raw())
+  for t in 0..<15 {
+    let a = pq.search(vectors[t * 7 % 200], 5, 8)
+    let b = back.search(vectors[t * 7 % 200], 5, 8)
+    assert_eq(a.length(), b.length())
+    for i in 0..<a.length() {
+      assert_eq(a[i].id, b[i].id)
+    }
+  }
+}
+
+///|
 test "ivf+rabitq high recall with rerank" {
   let dim = 64
   let ncenters = 20

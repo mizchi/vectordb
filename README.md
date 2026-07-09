@@ -362,10 +362,24 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、`to
 
 構成: `distance.mbt`（SIMD 距離）/ `quantize.mbt`（int8 量子化）/
 `index.mbt`（Flat + rerank）/ `ivf.mbt`（IVF: k-means++ + nprobe）/
-`hnsw.mbt`（HNSW グラフ）/ `bin_quant.mbt`（binary 1-bit）/
-`rabitq.mbt`（RaBitQ: 回転 + 符号 + 不偏推定）/ `ivf_rabitq.mbt`（IVF+RaBitQ）/
+`hnsw.mbt`（HNSW グラフ）/ `hnsw_q.mbt`（int8 グラフ HNSW）/
+`bin_quant.mbt`（binary 1-bit）/ `rabitq.mbt`（RaBitQ: 回転 + 符号 + 不偏推定）/
+`ivf_rabitq.mbt`（IVF+RaBitQ）/ `pq.mbt`（Product Quantization）/
 `storage.mbt`（`.vecdb` 相互運用）。
-量子化は Rust とほぼ同等（int8 / binary / RaBitQ / IVF+RaBitQ）を移植済み。
+量子化は Rust とほぼ同等（int8 / binary / RaBitQ / IVF+RaBitQ / **PQ**）を移植済み。
+
+**PQ**（`VECDBPQ1`）と **int8 グラフ HNSW**（`VECDBHQ1`）も Rust 版と同設計:
+
+```moonbit
+let pq = @vectordb.PqIndex::build(vectors, ids, @vectordb.L2, 16, 256, 20, true)
+let hits = pq.search(query, 10, 16)      // (k, oversample)
+let restored = @vectordb.PqIndex::from_bytes(pq.to_bytes())
+
+let hq = @vectordb.HnswQIndex::new(dim, @vectordb.L2, 16, 200, true)
+hq.add(1L, embedding)
+let hits = hq.search(query, 10, 96)      // int8グラフ + f32 rerank
+let restored2 = @vectordb.HnswQIndex::from_bytes(hq.to_bytes())
+```
 
 HNSW も Rust 版と同設計:
 

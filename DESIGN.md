@@ -147,9 +147,10 @@ query(f32)
   **IVF+RaBitQ**（セル毎重心） / **PQ(サブ空間分割 + ADC + rerank)** /
   **OPQ(学習回転 + PQ; 自作 Jacobi 固有値分解による直交 Procrustes)** /
   **IVF+PQ(粗量子化 + 残差 PQ; Faiss IVFPQ 相当)**。
-  MoonBit は int8 / binary / RaBitQ / IVF+RaBitQ。
+  MoonBit は int8 / binary / RaBitQ / IVF+RaBitQ / **PQ**。
 - **int8 グラフ HNSW**（`HnswQIndex`）: ノードを int8 で保持し f32 の約1/4メモリ。
   グラフの構築・探索とも量子化空間で行い、`keep_raw` 時のみ最終ビームを f32 で rerank。
+  MoonBit にも移植済み（`hnsw_q.mbt`, `VECDBHQ1`）。
 - PQ の共有プリミティブ（`train_codebooks` / `encode_vector` / `build_lut` / `adc_sum`）を
   `pq.rs` に切り出し、OPQ・IVF+PQ から再利用。
 
@@ -175,7 +176,7 @@ query(f32)
 
 ## 9. 今後の余地
 
-- MoonBit への OPQ / IVF+PQ / 並列 / mmap 相当の移植。
+- MoonBit への OPQ / IVF+PQ / 並列 / mmap 相当の移植（PQ・int8グラフHNSWは移植済み）。
 - IVF/HNSW tombstone の永続化（現状メモリ上のみ; Flat は永続化済み）。
 - フィルタ選択率に応じた探索の適応化、GPU/バッチ ADC の SIMD 最適化。
 - DiskANN 系のディスク常駐グラフ。
