@@ -338,3 +338,32 @@ test "hnsw cosine finds self" {
     assert_eq(hits[0].id, ids[i])
   }
 }
+
+///|
+test "hnsw bytes round-trip" {
+  let n = 400
+  let dim = 12
+  let rng = Rng::{ state: 0xCAFED00D_00C0FFEEUL }
+  let hnsw = HnswIndex::new(dim, L2, 16, 100)
+  let queries : Array[Array[Float]] = []
+  for i in 0..<n {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    hnsw.add(i.to_int64(), v)
+    if i < 15 {
+      queries.push(v)
+    }
+  }
+  let back = HnswIndex::from_bytes(hnsw.to_bytes())
+  assert_eq(back.length(), hnsw.length())
+  for q in queries {
+    let a = hnsw.search(q, 10, 64)
+    let b = back.search(q, 10, 64)
+    assert_eq(a.length(), b.length())
+    for i in 0..<a.length() {
+      assert_eq(a[i].id, b[i].id)
+    }
+  }
+}

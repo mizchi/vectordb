@@ -370,3 +370,136 @@ pub fn HnswIndex::search(
   }
   out
 }
+
+// ---------------------------------------------------------------------------
+// Persistence: HNSW `.vecdb` (magic "VECDBHN1"), same layout as the Rust crate.
+// Header (64B) + f32 vectors + u64 ids + u32 levels + variable-length links
+// (per node, per level: u32 len then len x u32 neighbor).
+// ---------------------------------------------------------------------------
+
+///|
+/// Serialize the graph to an HNSW `.vecdb` byte buffer.
+pub fn HnswIndex::to_bytes(self : HnswIndex) -> FixedArray[Byte] {
+  let dim = self.dim
+  let count = self.count
+  let mut links_bytes = 0
+  for i in 0..<count {
+    for lc in 0..<(self.levels[i] + 1) {
+      links_bytes = links_bytes + 4 + self.links[i][lc].length() * 4
+    }
+  }
+  let vec_off = align16(64)
+  let ids_off = align16(vec_off + count * dim * 4)
+  let lvl_off = align16(ids_off + count * 8)
+  let links_off = align16(lvl_off + count * 4)
+  let total = links_off + links_bytes
+  let b : FixedArray[Byte] = FixedArray::make(total, 0)
+
+  let magic : FixedArray[Byte] = [0x56, 0x45, 0x43, 0x44, 0x42, 0x48, 0x4E, 0x31]
+  for i in 0..<8 {
+    b[i] = magic[i]
+  }
+  write_u32_le(b, 8, 1)
+  write_u32_le(b, 12, metric_to_u32(self.metric))
+  write_u32_le(b, 16, dim.reinterpret_as_uint())
+  write_u32_le(b, 20, count.reinterpret_as_uint())
+  write_u32_le(b, 24, self.m.reinterpret_as_uint())
+  write_u32_le(b, 28, self.ef_construction.reinterpret_as_uint())
+  write_u32_le(b, 32, self.max_level.reinterpret_as_uint())
+  let entry_store = if self.entry < 0 { 0 } else { self.entry }
+  write_u32_le(b, 36, entry_store.reinterpret_as_uint())
+  write_u64_le(b, 40, self.rng)
+
+  for i in 0..<count {
+    for d in 0..<dim {
+      write_f32(b, vec_off + (i * dim + d) * 4, self.vectors[i][d])
+    }
+    write_u64_le(b, ids_off + i * 8, self.ids[i].reinterpret_as_uint64())
+    write_u32_le(b, lvl_off + i * 4, self.levels[i].reinterpret_as_uint())
+  }
+  let mut p = links_off
+  for i in 0..<count {
+    for lc in 0..<(self.levels[i] + 1) {
+      let nbrs = self.links[i][lc]
+      write_u32_le(b, p, nbrs.length().reinterpret_as_uint())
+      p = p + 4
+      for nb in nbrs {
+        write_u32_le(b, p, nb.reinterpret_as_uint())
+        p = p + 4
+      }
+    }
+  }
+  b
+}
+
+///|
+/// Parse an HNSW `.vecdb` byte buffer into an [`HnswIndex`].
+pub fn HnswIndex::from_bytes(b : FixedArray[Byte]) -> HnswIndex {
+  if b.length() < 64 {
+    abort("HnswIndex::from_bytes: buffer smaller than header")
+  }
+  // magic "VECDBHN1"
+  if b[0] != 0x56 || b[5] != 0x48 || b[6] != 0x4E || b[7] != 0x31 {
+    abort("HnswIndex::from_bytes: bad magic")
+  }
+  if read_u32_le(b, 8) != 1 {
+    abort("HnswIndex::from_bytes: unsupported version")
+  }
+  let metric = metric_from_u32(read_u32_le(b, 12))
+  let dim = read_u32_le(b, 16).reinterpret_as_int()
+  let count = read_u32_le(b, 20).reinterpret_as_int()
+  let m = read_u32_le(b, 24).reinterpret_as_int()
+  let ef_construction = read_u32_le(b, 28).reinterpret_as_int()
+  let max_level = read_u32_le(b, 32).reinterpret_as_int()
+  let entry_raw = read_u32_le(b, 36).reinterpret_as_int()
+  let rng = read_u64_le(b, 40)
+  let vec_off = align16(64)
+  let ids_off = align16(vec_off + count * dim * 4)
+  let lvl_off = align16(ids_off + count * 8)
+  let links_off = align16(lvl_off + count * 4)
+
+  let vectors : Array[Array[Float]] = []
+  let ids = Array::make(count, (0 : Int64))
+  let levels = Array::make(count, 0)
+  for i in 0..<count {
+    let row = Array::make(dim, (0.0 : Float))
+    for d in 0..<dim {
+      row[d] = read_f32(b, vec_off + (i * dim + d) * 4)
+    }
+    vectors.push(row)
+    ids[i] = read_u64_le(b, ids_off + i * 8).reinterpret_as_int64()
+    levels[i] = read_u32_le(b, lvl_off + i * 4).reinterpret_as_int()
+  }
+  let links : Array[Array[Array[Int]]] = []
+  let mut p = links_off
+  for i in 0..<count {
+    let node_links : Array[Array[Int]] = []
+    for _lc in 0..<(levels[i] + 1) {
+      let len = read_u32_le(b, p).reinterpret_as_int()
+      p = p + 4
+      let lst : Array[Int] = []
+      for _j in 0..<len {
+        lst.push(read_u32_le(b, p).reinterpret_as_int())
+        p = p + 4
+      }
+      node_links.push(lst)
+    }
+    links.push(node_links)
+  }
+  {
+    dim,
+    metric,
+    m,
+    m0: m * 2,
+    ef_construction,
+    ml: 1.0 / @math.ln(m.to_double()),
+    count,
+    vectors,
+    ids,
+    links,
+    levels,
+    entry: if count > 0 { entry_raw } else { -1 },
+    max_level,
+    rng,
+  }
+}

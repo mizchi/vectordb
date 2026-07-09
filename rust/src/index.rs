@@ -457,6 +457,45 @@ impl FlatIndex {
         }
     }
 
+    /// Add many vectors at once. With the `parallel` feature the per-vector
+    /// normalize + quantize work runs across the rayon pool, then the results
+    /// are appended in the input order (so ids/rows stay deterministic).
+    pub fn add_batch(&mut self, items: &[(u64, Vec<f32>)]) {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let dim = self.dim;
+            let cosine = self.metric == Metric::Cosine;
+            let keep_raw = self.raw.is_some();
+            let prepared: Vec<(u64, Quantized, Option<Vec<f32>>)> = items
+                .par_iter()
+                .map(|(id, v)| {
+                    assert_eq!(v.len(), dim, "dimension mismatch");
+                    let processed = if cosine { normalize(v) } else { v.clone() };
+                    let q = quantize(&processed);
+                    let kept = if keep_raw { Some(processed) } else { None };
+                    (*id, q, kept)
+                })
+                .collect();
+            for (id, q, kept) in prepared {
+                self.ids.push(id);
+                self.codes.extend_from_slice(&q.codes);
+                self.scales.push(q.scale);
+                self.sqnorms.push(q.sqnorm);
+                self.deleted.push(false);
+                if let (Some(raw), Some(p)) = (self.raw.as_mut(), kept) {
+                    raw.extend_from_slice(&p);
+                }
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (id, v) in items {
+                self.add(*id, v);
+            }
+        }
+    }
+
     /// Search for the `k` nearest neighbors (see [`View::search`]).
     pub fn search(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
         self.view().search(query, k, oversample)
@@ -609,6 +648,27 @@ mod tests {
         assert_eq!(batch.len(), 3);
         let batch0: Vec<u64> = batch[0].iter().map(|h| h.id).collect();
         assert_eq!(batch0, serial);
+    }
+
+    #[test]
+    fn add_batch_matches_sequential_add() {
+        let items: Vec<(u64, Vec<f32>)> = vec![
+            (10, vec![1.0, 0.0, 0.0, 0.0]),
+            (20, vec![0.0, 1.0, 0.0, 0.0]),
+            (30, vec![0.9, 0.1, 0.0, 0.0]),
+            (40, vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let mut seq = FlatIndex::new(4, Metric::Cosine, true);
+        for (id, v) in &items {
+            seq.add(*id, v);
+        }
+        let mut bat = FlatIndex::new(4, Metric::Cosine, true);
+        bat.add_batch(&items);
+        assert_eq!(seq.len(), bat.len());
+        let q = [1.0, 0.05, 0.0, 0.0];
+        let a: Vec<u64> = seq.search(&q, 4, 4).iter().map(|h| h.id).collect();
+        let b: Vec<u64> = bat.search(&q, 4, 4).iter().map(|h| h.id).collect();
+        assert_eq!(a, b);
     }
 
     #[test]

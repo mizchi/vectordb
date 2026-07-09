@@ -119,6 +119,9 @@ idx.save("graph.hnsw.vecdb")?;              // グラフを永続化（magic VEC
 let idx = HnswIndex::load("graph.hnsw.vecdb")?;
 ```
 
+`FlatIndex::add_batch(&[(id, vec)])` は正規化+量子化を rayon で並列化して一括追加する
+（`parallel` フィーチャ時。結果は入力順に追記され決定的）。
+
 ベンチ例（50k×128, cosine, 構築 ~8s）:
 
 | ef_search | ms/query | recall@10 |
@@ -301,6 +304,8 @@ HNSW も Rust 版と同設計:
 let idx = @vectordb.HnswIndex::new(dim, @vectordb.Cosine, 16, 200)
 idx.add(1L, embedding)
 let hits = idx.search(query, 10, 64)   // (k, ef_search)
+let bytes = idx.to_bytes()             // VECDBHN1 形式（Rust と同レイアウト）
+let restored = @vectordb.HnswIndex::from_bytes(bytes)
 ```
 
 IVF は Rust 版と同設計、`.vecdb`（`VECDBIV1`）永続化も対応:
