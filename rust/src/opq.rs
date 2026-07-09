@@ -134,6 +134,17 @@ impl OpqIndex {
 
     /// Search for the `k` nearest neighbors (rotate the query, then ADC + rerank).
     pub fn search(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
+        self.search_filter(query, k, oversample, |_| true)
+    }
+
+    /// Filtered search: only ids satisfying `filter` enter the candidate set.
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+        filter: F,
+    ) -> Vec<Hit> {
         if k == 0 || self.count == 0 {
             return Vec::new();
         }
@@ -155,6 +166,9 @@ impl OpqIndex {
         };
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for i in 0..self.count {
+            if !filter(self.ids[i]) {
+                continue;
+            }
             let acc = adc_sum(&lut, self.ksub, &self.codes[i * self.m..(i + 1) * self.m]);
             let key = if l2 { acc } else { -acc };
             push_bounded(&mut heap, Ranked { key, idx: i }, cand_n);
@@ -713,6 +727,16 @@ mod tests {
             opq_recall + 0.02 >= pq_recall,
             "OPQ ({opq_recall}) unexpectedly worse than PQ ({pq_recall})"
         );
+    }
+
+    #[test]
+    fn opq_filtered_search_restricts_ids() {
+        let dim = 16;
+        let items = skewed(1000, dim);
+        let opq = OpqIndex::build(&items, Metric::L2, 8, 64, 12, 3, true);
+        let got = opq.search_filter(&items[0].1, 10, 8, |id| id % 4 == 0);
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|h| h.id % 4 == 0));
     }
 
     #[test]

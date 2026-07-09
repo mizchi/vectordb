@@ -172,11 +172,25 @@ pub fn IvfPqIndex::search(
   nprobe : Int,
   oversample : Int,
 ) -> Array[Hit] {
+  self.search_filter(query, k, nprobe, oversample, fn(_id) { true })
+}
+
+///|
+/// Filtered search: only ids satisfying `filter` enter the candidate set
+/// (applied within each probed cell).
+pub fn IvfPqIndex::search_filter(
+  self : IvfPqIndex,
+  query : Array[Float],
+  k : Int,
+  nprobe : Int,
+  oversample : Int,
+  filter : (Int64) -> Bool,
+) -> Array[Hit] {
   if k <= 0 || self.count == 0 {
     return []
   }
   if query.length() != self.dim {
-    abort("IvfPqIndex::search: dimension mismatch")
+    abort("IvfPqIndex::search_filter: dimension mismatch")
   }
   let dim = self.dim
   let l2 = is_l2(self.metric)
@@ -224,6 +238,9 @@ pub fn IvfPqIndex::search(
     }
     let qc : Float = if l2 { 0.0 } else { dot_arr(processed, cen) }
     for i in self.offsets[c]..<self.offsets[c + 1] {
+      if !filter(self.ids[i]) {
+        continue
+      }
       let acc = pq_adc_sum(lut, self.ksub, self.codes, i * self.m, self.m)
       let key = if l2 { acc } else { -(qc + acc) }
       top.push(key, i)

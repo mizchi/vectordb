@@ -142,11 +142,23 @@ pub fn OpqIndex::search(
   k : Int,
   oversample : Int,
 ) -> Array[Hit] {
+  self.search_filter(query, k, oversample, fn(_id) { true })
+}
+
+///|
+/// Filtered search: only ids satisfying `filter` enter the candidate set.
+pub fn OpqIndex::search_filter(
+  self : OpqIndex,
+  query : Array[Float],
+  k : Int,
+  oversample : Int,
+  filter : (Int64) -> Bool,
+) -> Array[Hit] {
   if k <= 0 || self.count == 0 {
     return []
   }
   if query.length() != self.dim {
-    abort("OpqIndex::search: dimension mismatch")
+    abort("OpqIndex::search_filter: dimension mismatch")
   }
   let processed = if is_cosine(self.metric) { normalize(query) } else { query }
   let rq = opq_rotate(self.rot, processed, self.dim)
@@ -158,6 +170,9 @@ pub fn OpqIndex::search(
   }
   let top = TopK::new(cand_n)
   for i in 0..<self.count {
+    if !filter(self.ids[i]) {
+      continue
+    }
     let acc = pq_adc_sum(lut, self.ksub, self.codes, i * self.m, self.m)
     let key = if l2 { acc } else { -acc }
     top.push(key, i)

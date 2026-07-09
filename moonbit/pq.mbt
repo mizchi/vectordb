@@ -212,11 +212,24 @@ pub fn PqIndex::search(
   k : Int,
   oversample : Int,
 ) -> Array[Hit] {
+  self.search_filter(query, k, oversample, fn(_id) { true })
+}
+
+///|
+/// Filtered search: only ids satisfying `filter` enter the candidate set
+/// (applied during the ADC scan).
+pub fn PqIndex::search_filter(
+  self : PqIndex,
+  query : Array[Float],
+  k : Int,
+  oversample : Int,
+  filter : (Int64) -> Bool,
+) -> Array[Hit] {
   if k <= 0 || self.count == 0 {
     return []
   }
   if query.length() != self.dim {
-    abort("PqIndex::search: dimension mismatch")
+    abort("PqIndex::search_filter: dimension mismatch")
   }
   let processed = if is_cosine(self.metric) { normalize(query) } else { query }
   let l2 = is_l2(self.metric)
@@ -227,6 +240,9 @@ pub fn PqIndex::search(
   }
   let top = TopK::new(cand_n)
   for i in 0..<self.count {
+    if !filter(self.ids[i]) {
+      continue
+    }
     let acc = pq_adc_sum(lut, self.ksub, self.codes, i * self.m, self.m)
     let key = if l2 { acc } else { -acc }
     top.push(key, i)

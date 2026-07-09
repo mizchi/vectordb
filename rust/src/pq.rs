@@ -258,6 +258,18 @@ impl PqIndex {
     /// and `oversample > 1`, `k * oversample` ADC candidates are reranked with
     /// exact f32 distances.
     pub fn search(&self, query: &[f32], k: usize, oversample: usize) -> Vec<Hit> {
+        self.search_filter(query, k, oversample, |_| true)
+    }
+
+    /// Filtered search: only ids satisfying `filter` enter the candidate set
+    /// (applied during the ADC scan, so filtered-out vectors never compete).
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+        filter: F,
+    ) -> Vec<Hit> {
         if k == 0 || self.count == 0 {
             return Vec::new();
         }
@@ -277,6 +289,9 @@ impl PqIndex {
         };
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for i in 0..self.count {
+            if !filter(self.ids[i]) {
+                continue;
+            }
             push_bounded(
                 &mut heap,
                 Ranked {
@@ -547,6 +562,16 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pq_filtered_search_restricts_ids() {
+        let dim = 32;
+        let items = clustered(1000, dim, 10);
+        let pq = PqIndex::build(&items, Metric::L2, 8, 64, 12, true);
+        let got = pq.search_filter(&items[0].1, 10, 8, |id| id % 3 == 0);
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|h| h.id % 3 == 0));
     }
 
     #[test]

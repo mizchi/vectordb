@@ -163,6 +163,19 @@ impl IvfPqIndex {
 
     /// Search the `nprobe` nearest cells with residual ADC, then rerank.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize, oversample: usize) -> Vec<Hit> {
+        self.search_filter(query, k, nprobe, oversample, |_| true)
+    }
+
+    /// Filtered search: only ids satisfying `filter` enter the candidate set
+    /// (applied within each probed cell).
+    pub fn search_filter<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        oversample: usize,
+        filter: F,
+    ) -> Vec<Hit> {
         if k == 0 || self.count == 0 {
             return Vec::new();
         }
@@ -225,6 +238,9 @@ impl IvfPqIndex {
                 (dot_lut.clone(), dot_f32(&processed, cen))
             };
             for i in self.offsets[c]..self.offsets[c + 1] {
+                if !filter(self.ids[i]) {
+                    continue;
+                }
                 let acc = adc_sum(&lut, self.ksub, &self.codes[i * self.m..(i + 1) * self.m]);
                 let key = if l2 { acc } else { -(qc + acc) };
                 push_bounded(&mut heap, Ranked { key, idx: i }, cand_n);
@@ -502,6 +518,16 @@ mod tests {
             let hits = idx.search(v, 1, 8, 16);
             assert_eq!(hits[0].id, *id);
         }
+    }
+
+    #[test]
+    fn ivfpq_filtered_search_restricts_ids() {
+        let dim = 48;
+        let items = clustered(1500, dim, 20);
+        let idx = IvfPqIndex::build(&items, Metric::L2, 30, 12, 128, 12, true);
+        let got = idx.search_filter(&items[0].1, 10, 8, 16, |id| id % 2 == 0);
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|h| h.id % 2 == 0));
     }
 
     #[test]

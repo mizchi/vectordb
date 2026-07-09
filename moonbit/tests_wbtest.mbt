@@ -684,6 +684,38 @@ test "ivf+pq high recall with rerank" {
 }
 
 ///|
+test "pq-family filtered search restricts ids" {
+  let dim = 32
+  let rng = Rng::{ state: 0x1122_3344_5566_7788UL }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<800 {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let q = vectors[0]
+  let even = fn(id : Int64) -> Bool { id % 2L == 0L }
+  let pq = PqIndex::build(vectors, ids, L2, 8, 64, 12, true)
+  for h in pq.search_filter(q, 10, 8, even) {
+    assert_true(h.id % 2L == 0L)
+  }
+  let ipq = IvfPqIndex::build(vectors, ids, L2, 16, 8, 64, 12, true)
+  let g = ipq.search_filter(q, 10, 8, 8, even)
+  assert_true(g.length() > 0)
+  for h in g {
+    assert_true(h.id % 2L == 0L)
+  }
+  let opq = OpqIndex::build(vectors, ids, L2, 8, 64, 12, 2, true)
+  for h in opq.search_filter(q, 10, 8, even) {
+    assert_true(h.id % 2L == 0L)
+  }
+}
+
+///|
 test "ivf+pq bytes round-trip" {
   let (vectors, ids) = make_clusters()
   let idx = IvfPqIndex::build(vectors, ids, L2, 4, 2, 8, 15, true)
