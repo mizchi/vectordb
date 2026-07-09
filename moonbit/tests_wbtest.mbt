@@ -367,3 +367,54 @@ test "hnsw bytes round-trip" {
     }
   }
 }
+
+///|
+test "binary 1-bit + rerank recall vs exact" {
+  let dim = 64
+  let ncenters = 20
+  let rng = Rng::{ state: 0x00BADC0DE_0BADF00DUL }
+  let centers : Array[Array[Float]] = []
+  for _c in 0..<ncenters {
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = rng.unit() * 2.0 - 1.0
+    }
+    centers.push(v)
+  }
+  let vectors : Array[Array[Float]] = []
+  let ids : Array[Int64] = []
+  for i in 0..<2000 {
+    let c = centers[i % ncenters]
+    let v = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      v[j] = c[j] + (rng.unit() - 0.5) * 0.2
+    }
+    vectors.push(v)
+    ids.push(i.to_int64())
+  }
+  let bin = BinaryIndex::build(vectors, ids, Cosine, true)
+  assert_true(bin.code_bytes() == 2000 * 1 * 8) // 64 dims -> 1 word (8 bytes)
+  let flat = FlatIndex::build(vectors, ids, Cosine, true)
+  let mut hit = 0
+  let mut total = 0
+  for t in 0..<30 {
+    let c = centers[t % ncenters]
+    let q = Array::make(dim, (0.0 : Float))
+    for j in 0..<dim {
+      q[j] = c[j] + 0.01
+    }
+    let got = bin.search(q, 10, 16)
+    let truth = flat.search_exact(q, 10)
+    for g in got {
+      for e in truth {
+        if g.id == e.id {
+          hit = hit + 1
+          break
+        }
+      }
+    }
+    total = total + truth.length()
+  }
+  let recall = hit.to_double() / total.to_double()
+  assert_true(recall >= 0.90)
+}
