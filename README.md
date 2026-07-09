@@ -297,8 +297,9 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、`to
 構成: `distance.mbt`（SIMD 距離）/ `quantize.mbt`（int8 量子化）/
 `index.mbt`（Flat + rerank）/ `ivf.mbt`（IVF: k-means++ + nprobe）/
 `hnsw.mbt`（HNSW グラフ）/ `bin_quant.mbt`（binary 1-bit）/
-`rabitq.mbt`（RaBitQ: 回転 + 符号 + 不偏推定）/ `storage.mbt`（`.vecdb` 相互運用）。
-量子化は Rust とほぼ同等（int8 / binary / RaBitQ）を移植済み。
+`rabitq.mbt`（RaBitQ: 回転 + 符号 + 不偏推定）/ `ivf_rabitq.mbt`（IVF+RaBitQ）/
+`storage.mbt`（`.vecdb` 相互運用）。
+量子化は Rust とほぼ同等（int8 / binary / RaBitQ / IVF+RaBitQ）を移植済み。
 
 HNSW も Rust 版と同設計:
 
