@@ -27,10 +27,15 @@ cd rust
 cargo test                 # ユニット/結合テスト + doctest
 cargo run --release --example bench   # 速度・recall・メモリの目安
 
-# CLI（CSV: 1行 = id,v0,v1,...）
-cargo run --release --bin vecdb -- build vecs.csv idx.vecdb --metric cosine
-cargo run --release --bin vecdb -- info   idx.vecdb
-cargo run --release --bin vecdb -- search idx.vecdb query.csv -k 10 --oversample 4
+# CLI（CSV: 1行 = id,v0,v1,...）。索引種別は検索時にマジックで自動判定。
+V="cargo run --release --bin vecdb --"
+$V build      vecs.csv flat.vecdb --metric cosine         # Flat（int8+rerank）
+$V build-ivf  vecs.csv ivf.vecdb  --metric cosine --nlist 256
+$V build-hnsw vecs.csv hnsw.vecdb --metric cosine -m 16 --ef-construction 200
+$V info   hnsw.vecdb
+$V search flat.vecdb query.csv -k 10 --oversample 4
+$V search ivf.vecdb  query.csv -k 10 --nprobe 16
+$V search hnsw.vecdb query.csv -k 10 --ef 64
 # 最小サイズ（int8のみ・rerankなし）: build に --compact
 ```
 
