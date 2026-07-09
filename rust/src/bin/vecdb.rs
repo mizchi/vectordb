@@ -1,19 +1,22 @@
-//! Minimal CLI for the vectordb `.vecdb` formats (Flat / IVF / HNSW).
+//! Minimal CLI for the vectordb `.vecdb` formats
+//! (Flat / IVF / HNSW / int8-HNSW / PQ).
 //!
 //! Vectors are read/written as CSV-ish text: one record per line,
 //! `id,v0,v1,...,vD-1`.
 //!
 //! Usage:
-//!   vecdb build      <in.csv> <out.vecdb> [--metric l2|dot|cosine] [--compact]
-//!   vecdb build-ivf  <in.csv> <out.vecdb> [--metric m] [--nlist N] [--iters N]
-//!   vecdb build-hnsw <in.csv> <out.vecdb> [--metric m] [-m M] [--ef-construction N]
-//!   vecdb search     <index.vecdb> <query.csv> [-k N] [--oversample M]
-//!                    [--nprobe N] [--ef N]   (index type auto-detected)
-//!   vecdb info       <index.vecdb>
+//!   vecdb build        <in.csv> <out.vecdb> [--metric l2|dot|cosine] [--compact]
+//!   vecdb build-ivf    <in.csv> <out.vecdb> [--metric m] [--nlist N] [--iters N]
+//!   vecdb build-hnsw   <in.csv> <out.vecdb> [--metric m] [-m M] [--ef-construction N]
+//!   vecdb build-hnsw-q <in.csv> <out.vecdb> [--metric m] [-m M] [--ef-construction N] [--compact]
+//!   vecdb build-pq     <in.csv> <out.vecdb> [--metric m] [--pq-m M] [--ksub K] [--iters N] [--compact]
+//!   vecdb search       <index.vecdb> <query.csv> [-k N] [--oversample M]
+//!                      [--nprobe N] [--ef N]   (index type auto-detected)
+//!   vecdb info         <index.vecdb>
 
 use std::io::Read;
 use std::process::ExitCode;
-use vectordb::{save, FlatIndex, Hit, HnswIndex, IvfIndex, Metric};
+use vectordb::{save, FlatIndex, Hit, HnswIndex, HnswQIndex, IvfIndex, Metric, PqIndex};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,10 +26,14 @@ fn main() -> ExitCode {
         Some("build") => cmd_build(rest),
         Some("build-ivf") => cmd_build_ivf(rest),
         Some("build-hnsw") => cmd_build_hnsw(rest),
+        Some("build-hnsw-q") => cmd_build_hnsw_q(rest),
+        Some("build-pq") => cmd_build_pq(rest),
         Some("search") => cmd_search(rest),
         Some("info") => cmd_info(rest),
         _ => {
-            eprintln!("usage: vecdb <build|build-ivf|build-hnsw|search|info> ...");
+            eprintln!(
+                "usage: vecdb <build|build-ivf|build-hnsw|build-hnsw-q|build-pq|search|info> ..."
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -44,6 +51,8 @@ enum Kind {
     Flat,
     Ivf,
     Hnsw,
+    HnswQ,
+    Pq,
 }
 
 fn detect(path: &str) -> Result<Kind, String> {
@@ -54,6 +63,8 @@ fn detect(path: &str) -> Result<Kind, String> {
         b"VECDB1\0\0" => Ok(Kind::Flat),
         b"VECDBIV1" => Ok(Kind::Ivf),
         b"VECDBHN1" => Ok(Kind::Hnsw),
+        b"VECDBHQ1" => Ok(Kind::HnswQ),
+        b"VECDBPQ1" => Ok(Kind::Pq),
         _ => Err("unrecognized index file (bad magic)".into()),
     }
 }
@@ -167,13 +178,61 @@ fn cmd_build_hnsw(args: &[String]) -> Result<(), String> {
         idx.add(*id, v);
     }
     idx.save(&output).map_err(|e| e.to_string())?;
-    println!("built hnsw: {} vectors (dim {dim}, {metric:?}, M {m}) -> {output}", idx.len());
+    println!(
+        "built hnsw: {} vectors (dim {dim}, {metric:?}, M {m}) -> {output}",
+        idx.len()
+    );
+    Ok(())
+}
+
+fn cmd_build_hnsw_q(args: &[String]) -> Result<(), String> {
+    let (_, output, dim, records) = load_build_input(args)?;
+    let metric = flag_value(args, "--metric").map_or(Ok(Metric::Cosine), parse_metric)?;
+    let m: usize = parse_flag(args, "-m", 16)?;
+    let efc: usize = parse_flag(args, "--ef-construction", 200)?;
+    let compact = args.iter().any(|a| a == "--compact");
+    let mut idx = HnswQIndex::new(dim, metric, m, efc, !compact);
+    for (id, v) in &records {
+        idx.add(*id, v);
+    }
+    idx.save(&output).map_err(|e| e.to_string())?;
+    println!(
+        "built hnsw-q (int8 graph): {} vectors (dim {dim}, {metric:?}, M {m}, {}) -> {output}",
+        idx.len(),
+        if compact {
+            "int8-only"
+        } else {
+            "int8+raw rerank"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_build_pq(args: &[String]) -> Result<(), String> {
+    let (_, output, dim, records) = load_build_input(args)?;
+    let metric = flag_value(args, "--metric").map_or(Ok(Metric::Cosine), parse_metric)?;
+    let pq_m: usize = parse_flag(args, "--pq-m", 16)?;
+    let ksub: usize = parse_flag(args, "--ksub", 256)?;
+    let iters: usize = parse_flag(args, "--iters", 20)?;
+    let compact = args.iter().any(|a| a == "--compact");
+    if !dim.is_multiple_of(pq_m) {
+        return Err(format!("--pq-m {pq_m} must divide dim {dim}"));
+    }
+    let idx = PqIndex::build(&records, metric, pq_m, ksub, iters, !compact);
+    idx.save(&output).map_err(|e| e.to_string())?;
+    println!(
+        "built pq: {} vectors (dim {dim}, {metric:?}, m {pq_m}, ksub {ksub}, {} bytes/vec) -> {output}",
+        idx.len(),
+        idx.code_bytes() / idx.len().max(1)
+    );
     Ok(())
 }
 
 fn cmd_search(args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
-        return Err("search <index.vecdb> <query.csv> [-k N] [--oversample M] [--nprobe N] [--ef N]".into());
+        return Err(
+            "search <index.vecdb> <query.csv> [-k N] [--oversample M] [--nprobe N] [--ef N]".into(),
+        );
     }
     let index_path = &args[0];
     let query_path = &args[1];
@@ -207,6 +266,16 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
             let idx = HnswIndex::load(index_path).map_err(|e| e.to_string())?;
             check_dims(&qvs, idx.dim())?;
             qvs.iter().map(|v| idx.search(v, k, ef)).collect()
+        }
+        Kind::HnswQ => {
+            let idx = HnswQIndex::load(index_path).map_err(|e| e.to_string())?;
+            check_dims(&qvs, idx.dim())?;
+            qvs.iter().map(|v| idx.search(v, k, ef)).collect()
+        }
+        Kind::Pq => {
+            let idx = PqIndex::load(index_path).map_err(|e| e.to_string())?;
+            check_dims(&qvs, idx.dim())?;
+            qvs.iter().map(|v| idx.search(v, k, over)).collect()
         }
     };
 
@@ -256,6 +325,24 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
             println!("count:   {}", idx.len());
             println!("dim:     {}", idx.dim());
             println!("metric:  {:?}", idx.metric());
+        }
+        Kind::HnswQ => {
+            let idx = HnswQIndex::load(path).map_err(|e| e.to_string())?;
+            println!("path:    {path}");
+            println!("type:    hnsw-q (int8 graph)");
+            println!("count:   {}", idx.len());
+            println!("dim:     {}", idx.dim());
+            println!("metric:  {:?}", idx.metric());
+            println!("raw f32: {}", idx.has_raw());
+        }
+        Kind::Pq => {
+            let idx = PqIndex::load(path).map_err(|e| e.to_string())?;
+            println!("path:    {path}");
+            println!("type:    pq");
+            println!("count:   {}", idx.len());
+            println!("dim:     {}", idx.dim());
+            println!("metric:  {:?}", idx.metric());
+            println!("raw f32: {}", idx.has_raw());
         }
     }
     Ok(())

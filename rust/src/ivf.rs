@@ -167,7 +167,14 @@ impl IvfIndex {
                 if !filter(self.ids[i]) {
                     continue;
                 }
-                push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
+                push_bounded(
+                    &mut heap,
+                    Ranked {
+                        key: self.approx_key_at(i, &q),
+                        idx: i,
+                    },
+                    cand_n,
+                );
             }
         }
         self.finish_from(heap, &processed, k, oversample)
@@ -198,7 +205,14 @@ impl IvfIndex {
         let heap = if cand.len() < IVF_PAR_THRESHOLD {
             let mut h: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
             for &i in &cand {
-                push_bounded(&mut h, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
+                push_bounded(
+                    &mut h,
+                    Ranked {
+                        key: self.approx_key_at(i, &q),
+                        idx: i,
+                    },
+                    cand_n,
+                );
             }
             h
         } else {
@@ -206,7 +220,14 @@ impl IvfIndex {
                 .fold(
                     || BinaryHeap::with_capacity(cand_n + 1),
                     |mut h, &i| {
-                        push_bounded(&mut h, Ranked { key: self.approx_key_at(i, &q), idx: i }, cand_n);
+                        push_bounded(
+                            &mut h,
+                            Ranked {
+                                key: self.approx_key_at(i, &q),
+                                idx: i,
+                            },
+                            cand_n,
+                        );
                         h
                     },
                 )
@@ -240,7 +261,11 @@ impl IvfIndex {
     }
 
     /// Shared query prep: process, quantize, pick the nprobe nearest cells.
-    fn probe(&self, query: &[f32], nprobe: usize) -> (Vec<f32>, crate::quantize::Quantized, Vec<usize>) {
+    fn probe(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+    ) -> (Vec<f32>, crate::quantize::Quantized, Vec<usize>) {
         assert_eq!(query.len(), self.dim, "dimension mismatch");
         let processed = if self.metric == Metric::Cosine {
             normalize(query)
@@ -405,7 +430,14 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
 }
 fn get_f32s(b: &[u8], off: usize, n: usize) -> Vec<f32> {
     (0..n)
-        .map(|i| f32::from_le_bytes([b[off + i * 4], b[off + i * 4 + 1], b[off + i * 4 + 2], b[off + i * 4 + 3]]))
+        .map(|i| {
+            f32::from_le_bytes([
+                b[off + i * 4],
+                b[off + i * 4 + 1],
+                b[off + i * 4 + 2],
+                b[off + i * 4 + 3],
+            ])
+        })
         .collect()
 }
 
@@ -631,12 +663,9 @@ fn assign_points(
     assign: &mut [usize],
 ) {
     use rayon::prelude::*;
-    assign
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, a)| {
-            *a = nearest_centroid(&data[i * dim..(i + 1) * dim], centroids, nlist, dim);
-        });
+    assign.par_iter_mut().enumerate().for_each(|(i, a)| {
+        *a = nearest_centroid(&data[i * dim..(i + 1) * dim], centroids, nlist, dim);
+    });
     let _ = n;
 }
 
@@ -758,13 +787,20 @@ mod tests {
         let items: Vec<(u64, Vec<f32>)> = (0..n)
             .map(|i| {
                 let c = &centers[i % ncenters];
-                (i as u64, c.iter().map(|x| x + (next() - 0.5) * 0.1).collect())
+                (
+                    i as u64,
+                    c.iter().map(|x| x + (next() - 0.5) * 0.1).collect(),
+                )
             })
             .collect();
         let idx = IvfIndex::build(dim, Metric::L2, 64, &items, true, 8);
         let q: Vec<f32> = centers[3].iter().map(|x| x + 0.01).collect();
         let a: Vec<u64> = idx.search(&q, 10, 32, 8).iter().map(|h| h.id).collect();
-        let b: Vec<u64> = idx.search_parallel(&q, 10, 32, 8).iter().map(|h| h.id).collect();
+        let b: Vec<u64> = idx
+            .search_parallel(&q, 10, 32, 8)
+            .iter()
+            .map(|h| h.id)
+            .collect();
         assert_eq!(a, b);
     }
 

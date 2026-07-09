@@ -438,7 +438,9 @@ impl HnswIndex {
                 u64::from_le_bytes(a)
             })
             .collect();
-        let levels: Vec<usize> = (0..count).map(|i| u32_at(lvl_off + i * 4) as usize).collect();
+        let levels: Vec<usize> = (0..count)
+            .map(|i| u32_at(lvl_off + i * 4) as usize)
+            .collect();
 
         let mut links: Vec<Vec<Vec<u32>>> = Vec::with_capacity(count);
         let mut p = links_off;
@@ -517,7 +519,11 @@ mod tests {
             let q = &items[t * 13 % items.len()].1;
             let truth: std::collections::HashSet<u64> =
                 flat.search_exact(q, 10).iter().map(|h| h.id).collect();
-            hit += idx.search(q, 10, 64).iter().filter(|h| truth.contains(&h.id)).count();
+            hit += idx
+                .search(q, 10, 64)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
             total += truth.len();
         }
         let recall = hit as f64 / total as f64;

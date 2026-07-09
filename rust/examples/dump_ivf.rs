@@ -12,7 +12,14 @@ fn main() {
         (2, vec![-1.0, 0.5, 4.0]),
         (3, vec![0.0, 0.0, 1.0]),
     ];
-    let idx = IvfIndex::build(3, Metric::L2, /*nlist=*/ 3, &items, /*keep_raw=*/ true, 1);
+    let idx = IvfIndex::build(
+        3,
+        Metric::L2,
+        /*nlist=*/ 3,
+        &items,
+        /*keep_raw=*/ true,
+        1,
+    );
     let path = std::env::temp_dir().join("interop_ivf.vecdb");
     idx.save(&path).unwrap();
     let bytes = std::fs::read(&path).unwrap();

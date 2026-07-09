@@ -98,7 +98,7 @@ storage    .vecdb 単一ファイル（save / load / mmap）
 | 12 | 4 | u32 | metric (0=L2, 1=Dot, 2=Cosine) |
 | 16 | 4 | u32 | dim |
 | 20 | 4 | u32 | count |
-| 24 | 4 | u32 | flags (bit0: raw f32 セクションあり) |
+| 24 | 4 | u32 | flags (bit0: raw f32, bit1: 削除ビット, bit2: ペイロード) |
 | 28 | 4 | u32 | reserved |
 | 32 | 32 | — | reserved（0 埋め） |
 
@@ -109,9 +109,15 @@ storage    .vecdb 単一ファイル（save / load / mmap）
 3. `sqnorms`: `count × f32` — 格納ベクトルの二乗ノルム（L2 復元・cosine 検証用）
 4. `codes`  : `count × dim × i8` — int8 量子化コード（row-major）
 5. `raw`    : `count × dim × f32` — 生ベクトル（flags bit0 のときのみ。rerank/厳密用）
+6. `deleted`: `count × u8` — tombstone（flags bit1 のときのみ。0=生存, 1=削除）
+7. `payload_offsets` : `(count+1) × u64` — 各ペイロードの CSR オフセット（flags bit2）
+8. `payload_blob`    : `Σlen × u8` — 連結したペイロード本体（flags bit2）
 
 `raw` を省くと最小サイズ（int8 のみ、rerank 不可）。含めると int8 スキャン +
-f32 rerank の両立。Rust と MoonBit で同一バイト列を読み書きでき、相互運用可能。
+f32 rerank の両立。削除ビット・ペイロードのセクションは**実際に tombstone /
+payload を持つときのみ**書き出すので、どちらも無いインデックスは従来の v1 と
+バイト完全一致。Rust と MoonBit で先頭セクションを同一に読み書きでき（MoonBit は
+末尾の追加セクションを無視）、相互運用可能。
 
 ## 7. 検索パイプライン
 
@@ -138,11 +144,17 @@ query(f32)
 
 ### 量子化（Rust）
 - int8 スカラ / **binary(1-bit, Hamming)** / **RaBitQ(回転+符号+不偏推定)** /
-  **IVF+RaBitQ**（セル毎重心）。MoonBit は int8 / binary。
+  **IVF+RaBitQ**（セル毎重心） / **PQ(Product Quantization: サブ空間分割 + ADC + rerank)**。
+  MoonBit は int8 / binary / RaBitQ / IVF+RaBitQ。
+- **int8 グラフ HNSW**（`HnswQIndex`）: ノードを int8 で保持し f32 の約1/4メモリ。
+  グラフの構築・探索とも量子化空間で行い、`keep_raw` 時のみ最終ビームを f32 で rerank。
 
 ### 運用機能（Rust）
-- **フィルタ付き検索**（述語, Flat/IVF/HNSW）、**ソフト削除 + compact**、**upsert**、
-  **バッチ挿入**（rayon 並列）、**ペイロード**（メタデータ、in-memory）。
+- **フィルタ付き検索**（述語, Flat/IVF/HNSW/HnswQ）、**ソフト削除 + compact**、**upsert**、
+  **バッチ挿入**（rayon 並列）、**ペイロード**（メタデータ）。
+- **ペイロード / tombstone の永続化**: Flat `.vecdb` にフラグ付きの追加セクション
+  （削除ビット・可変長ペイロード）を持たせ、save/load・mmap 双方で復元。tombstone/
+  payload が無いインデックスは従来と**バイト完全一致**（MoonBit 互換を維持）。
 - MoonBit も **フィルタ付き検索**（述語, Flat/IVF/HNSW）を移植済み。
 - **rayon 並列**（クエリ内/バッチ）、**mmap 永続化**。
 - 全索引が `.vecdb` 系フォーマットで **save/load**（Flat=`VECDB1`, IVF=`VECDBIV1`,
@@ -158,7 +170,7 @@ query(f32)
 
 ## 9. 今後の余地
 
-- ペイロードや tombstone の永続化（`.vecdb` 形式のバージョン拡張）。
-- HNSW の量子化版（int8 グラフで省メモリ）、IVF/HNSW の削除・更新。
-- MoonBit への RaBitQ / 並列 / mmap 相当の移植。
-- PQ（Product Quantization）、フィルタ選択率に応じた探索の適応化。
+- IVF/HNSW の削除・更新（現状 Flat のみ tombstone 対応）。
+- MoonBit への PQ / 並列 / mmap 相当の移植。
+- OPQ（回転付き PQ）、IVF+PQ の統合、フィルタ選択率に応じた探索の適応化。
+- PQ / int8 グラフ HNSW の MoonBit 移植。

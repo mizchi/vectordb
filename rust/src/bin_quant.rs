@@ -104,7 +104,14 @@ impl BinaryIndex {
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for i in 0..self.len() {
             let h = hamming(&self.bits[i * self.words..(i + 1) * self.words], &qbits);
-            push_bounded(&mut heap, Ranked { key: h as f32, idx: i }, cand_n);
+            push_bounded(
+                &mut heap,
+                Ranked {
+                    key: h as f32,
+                    idx: i,
+                },
+                cand_n,
+            );
         }
 
         if self.raw.is_some() && oversample > 1 {
@@ -221,7 +228,10 @@ mod tests {
         let items: Vec<(u64, Vec<f32>)> = (0..3000)
             .map(|i| {
                 let c = &centers[i % ncenters];
-                (i as u64, c.iter().map(|x| x + (next() - 0.5) * 0.2).collect())
+                (
+                    i as u64,
+                    c.iter().map(|x| x + (next() - 0.5) * 0.2).collect(),
+                )
             })
             .collect();
 

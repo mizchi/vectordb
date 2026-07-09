@@ -29,14 +29,17 @@ cargo run --release --example bench   # 速度・recall・メモリの目安
 
 # CLI（CSV: 1行 = id,v0,v1,...）。索引種別は検索時にマジックで自動判定。
 V="cargo run --release --bin vecdb --"
-$V build      vecs.csv flat.vecdb --metric cosine         # Flat（int8+rerank）
-$V build-ivf  vecs.csv ivf.vecdb  --metric cosine --nlist 256
-$V build-hnsw vecs.csv hnsw.vecdb --metric cosine -m 16 --ef-construction 200
+$V build        vecs.csv flat.vecdb --metric cosine         # Flat（int8+rerank）
+$V build-ivf    vecs.csv ivf.vecdb  --metric cosine --nlist 256
+$V build-hnsw   vecs.csv hnsw.vecdb --metric cosine -m 16 --ef-construction 200
+$V build-hnsw-q vecs.csv hnswq.vecdb --metric cosine        # int8グラフHNSW（省メモリ）
+$V build-pq     vecs.csv pq.vecdb   --metric cosine --pq-m 16 --ksub 256  # Product Quantization
 $V info   hnsw.vecdb
 $V search flat.vecdb query.csv -k 10 --oversample 4
 $V search ivf.vecdb  query.csv -k 10 --nprobe 16
 $V search hnsw.vecdb query.csv -k 10 --ef 64
-# 最小サイズ（int8のみ・rerankなし）: build に --compact
+$V search pq.vecdb   query.csv -k 10 --oversample 8
+# 最小サイズ（rerankなし）: build / build-hnsw-q / build-pq に --compact
 ```
 
 ライブラリAPI:
@@ -186,15 +189,46 @@ let hits = idx.search(&query, 10, /*nprobe=*/16, /*oversample=*/32);
 1-bit 推定量は int8 より粗いので recall は rerank 候補数（oversample）で決まる。
 oversample を上げると **int8 の 1/8 のメモリで recall 1.0** に到達する。
 
+### Product Quantization（`pq.rs` の `PqIndex`）
+
+`dim` を `m` 個のサブベクトル（各 `dim/m` 次元）に分割し、サブ空間ごとに小さな
+コードブック（k-means, `ksub` 重心）で独立に量子化。1ベクトルを `m` バイト（`ksub<=256`）
+で表す（例: 128次元 f32 → `m=16` で 16 バイト = **32x 圧縮**）。検索は **ADC**
+（非対称距離計算）: クエリは全精度のまま、`m*ksub` の距離テーブルを前計算し、各DB
+ベクトルの近似距離を `m` 回のテーブル参照の総和で求める。`keep_raw` で f32 rerank も可能。
+
+```rust
+use vectordb::{PqIndex, Metric};
+let pq = PqIndex::build(&items, Metric::L2, /*m=*/16, /*ksub=*/256, /*iters=*/20, /*keep_raw=*/true);
+let hits = pq.search(&query, 10, /*oversample=*/16);
+pq.save("index.pq.vecdb")?;                    // magic VECDBPQ1
+```
+
+### int8 グラフ HNSW（`hnsw_q.rs` の `HnswQIndex`）
+
+HNSW と同じグラフだが、各ノードを int8 コード + per-vector scale/sqnorm で保持
+（≈`dim+8` バイト vs f32 の `dim*4`、ベクトル部で約 1/4）。グラフの**構築・探索とも
+量子化空間**で行い、`keep_raw` 時は最終ビームだけ f32 で rerank して recall を回復。
+
+```rust
+use vectordb::{HnswQIndex, Metric};
+let mut idx = HnswQIndex::new(dim, Metric::L2, 16, 200, /*keep_raw=*/true);
+idx.add(1, &embedding);
+let hits = idx.search(&query, 10, /*ef_search=*/96);   // rerank付きで高recall
+idx.save("graph.hnswq.vecdb")?;                        // magic VECDBHQ1
+```
+
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
 - `quantize.rs` — int8 スカラ量子化
 - `index.rs` — Flat 検索 + rerank（`View` に集約し owned/mmap で共有）+ rayon 並列
 - `hnsw.rs` — HNSW（多層グラフ, 近傍ヒューリスティック）
+- `hnsw_q.rs` — int8 グラフ HNSW（省メモリ, 量子化空間探索 + f32 rerank）
 - `ivf.rs` — IVF（k-means + nprobe 探索）+ save/load + 並列
 - `bin_quant.rs` — binary(1-bit) 量子化 + ハミング + rerank
 - `rabitq.rs` — RaBitQ(1-bit + 回転 + 不偏推定量) + IVF+RaBitQ
-- `storage.rs` — `.vecdb` の save / mmap open / load
+- `pq.rs` — Product Quantization（サブ空間分割 + ADC + rerank）
+- `storage.rs` — `.vecdb` の save / mmap open / load（tombstone/payload 永続化含む）
 
 ## MoonBit（試作）
 
@@ -352,16 +386,21 @@ let hits = hnsw.search_filter(&query, 10, /*ef*/128, |id| id < 1000);
 
 **ペイロード（メタデータ）**: `add_with_payload(id, vec, bytes)` で各ベクトルに任意の
 バイト列を付与し、`payload(id)` で取得できる（検索は id を返すので id→payload を引く）。
-メモリ上のみで `.vecdb` には保存しない。
+`.vecdb` に**永続化**され、`load` / `open`（mmap）双方で復元される（mmap 版もブロブは
+マップ上をゼロコピー参照）。
 
 ```rust
 idx.add_with_payload(1, &emb, br#"{"title":"..."}"#);
 let meta: Option<&[u8]> = idx.payload(1);
+save(&idx, "idx.vecdb")?;                       // ペイロードも書き出される
+let m = open("idx.vecdb")?;                     // mmap でも payload(1) が引ける
 ```
 
 **ソフト削除（tombstone）**: `FlatIndex::remove(id)` で論理削除（検索から除外）、
-`compact()` で物理削除して領域回収。削除はメモリ上のみなので、永続化する場合は
-`compact()` 後に `save()`。
+`compact()` で物理削除して領域回収。tombstone は `.vecdb` に**永続化**され、`load` /
+`open`（mmap）双方で削除状態のまま復元される（tombstone を残さず捨てたい場合は
+`compact()` 後に `save()`）。tombstone も payload も無いインデックスは従来と
+**バイト完全一致**なので MoonBit 互換は維持される。
 
 ```rust
 idx.remove(42);            // tombstone（検索から消える）
@@ -382,27 +421,35 @@ cargo run --release --example eval -- siftsmall
 
 | 方式 | recall@10 | ms/query | qps |
 |---|---|---|---|
-| flat exact f32 | 1.0000 | 0.29 | 3.4k |
-| flat int8+rerank (o=8) | **1.0000** | 0.24 | 4.1k |
-| binary 1-bit+rerank (o=32) | **0.0370** | 0.13 | 7.9k |
-| RaBitQ flat+rerank (o=32) | **0.9990** | 0.56 | 1.8k |
-| IVF nprobe=16 (o=8) | 0.9980 | 0.068 | 14.8k |
-| IVF+RaBitQ nprobe=16 (o=32) | 0.9980 | 0.59 | 1.7k |
-| HNSW efSearch=32 | 0.9940 | 0.035 | 28.4k |
-| HNSW efSearch=128 | 1.0000 | 0.098 | 10.2k |
+| flat exact f32 | 1.0000 | 0.19 | 5.3k |
+| flat int8+rerank (o=8) | **1.0000** | 0.17 | 6.0k |
+| binary 1-bit+rerank (o=32) | **0.0370** | 0.07 | 13.7k |
+| RaBitQ flat+rerank (o=32) | **0.9990** | 0.40 | 2.5k |
+| PQ m=16 (o=32) | **1.0000** | 0.29 | 3.4k |
+| IVF nprobe=16 (o=8) | 0.9910 | 0.059 | 16.9k |
+| IVF+RaBitQ nprobe=16 (o=32) | 0.9910 | 0.42 | 2.4k |
+| HNSW efSearch=32 | 0.9940 | 0.025 | 40.4k |
+| HNSW efSearch=128 | 1.0000 | 0.071 | 14.1k |
+| HNSW-q(int8) efSearch=64 | 0.9970 | 0.039 | 25.7k |
 
 読み取れること（実データならでは）:
 - **int8+rerank は実データでも recall 1.0**。省メモリの安全な既定。
 - **素の binary は recall 0.037 で壊滅**。SIFT は値が非負なので符号ビットが全て 1 に
   なり情報が消える。**RaBitQ は重心を引くので 0.999** — naive binary に対する RaBitQ の
   優位が実データで明確に出る。
-- **HNSW が最高スループット**（recall 0.994 で 28k qps、flat の ~8倍）。
-- **IVF** は recall/qps のバランスが良い（0.998 で 14.8k qps）。
+- **PQ は 16 バイト/ベクトル（32x 圧縮）で rerank 併用 recall 1.0**。ADC テーブルで
+  スキャンは軽い。
+- **HNSW が最高スループット**（recall 0.994 で 40k qps、flat の ~8倍）。
+- **int8 グラフ HNSW は f32 HNSW とほぼ同 recall/qps**（0.997 で 25.7k qps）を
+  **ベクトル部 1/4 のメモリ**で達成。
+- **IVF** は recall/qps のバランスが良い（0.991 で 16.9k qps）。
 
 ## 段階的な拡張
 
-Flat を土台に、同じ距離カーネル・量子化の上へ IVF（セル分割）→ HNSW、量子化は
-PQ / Binary / RaBitQ を追加していける設計。詳細は `DESIGN.md` の「段階的拡張」。
+Flat を土台に、同じ距離カーネル・量子化の上へインデックス（IVF → HNSW → int8 グラフ
+HNSW）と量子化（Binary / RaBitQ / IVF+RaBitQ / PQ）を積み上げた構成。いずれも
+`.vecdb` 系フォーマットで save/load でき、CLI から種別自動判定で扱える。設計の経緯は
+`DESIGN.md` を参照。
 
 ## ライセンス
 

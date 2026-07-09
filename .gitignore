@@ -13,3 +13,8 @@
 
 # Local data
 *.vecdb
+
+# Evaluation datasets (downloaded on demand; see README)
+/rust/siftsmall/
+*.fvecs
+*.ivecs

@@ -30,16 +30,16 @@ use std::collections::BinaryHeap;
 pub struct RabitqIndex {
     dim: usize,
     metric: Metric,
-    words: usize, // u64 words per vector
+    words: usize,  // u64 words per vector
     rot: Vec<f32>, // dim * dim row-major random rotation
     centroid: Vec<f32>,
     cc: f32, // <c, c>
     ids: Vec<u64>,
-    signs: Vec<u64>, // count * words: sign bits of rotated residuals
-    popcnt: Vec<u32>, // number of set sign bits per vector
-    res_sq: Vec<f32>, // ||o - c||^2
-    coef: Vec<f32>,  // ||r||^2 / sum|r_i|
-    oc: Vec<f32>,    // <o, c> (for dot/cosine reconstruction)
+    signs: Vec<u64>,       // count * words: sign bits of rotated residuals
+    popcnt: Vec<u32>,      // number of set sign bits per vector
+    res_sq: Vec<f32>,      // ||o - c||^2
+    coef: Vec<f32>,        // ||r||^2 / sum|r_i|
+    oc: Vec<f32>,          // <o, c> (for dot/cosine reconstruction)
     raw: Option<Vec<f32>>, // originals for exact rerank
 }
 
@@ -192,7 +192,10 @@ impl RabitqIndex {
         };
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(cand_n + 1);
         for i in 0..self.len() {
-            let s = qq.estimate_sign_dot(&self.signs[i * self.words..(i + 1) * self.words], self.popcnt[i]);
+            let s = qq.estimate_sign_dot(
+                &self.signs[i * self.words..(i + 1) * self.words],
+                self.popcnt[i],
+            );
             let ip_c = self.coef[i] * s; // estimate of <o-c, q-c>
             let key = if l2 {
                 self.res_sq[i] + qr_sq - 2.0 * ip_c
@@ -307,16 +310,16 @@ pub struct IvfRabitqIndex {
     metric: Metric,
     nlist: usize,
     words: usize,
-    rot: Vec<f32>,        // dim * dim rotation
-    centroids: Vec<f32>,  // nlist * dim
-    cc: Vec<f32>,         // <c, c> per cell
-    offsets: Vec<usize>,  // nlist + 1
+    rot: Vec<f32>,       // dim * dim rotation
+    centroids: Vec<f32>, // nlist * dim
+    cc: Vec<f32>,        // <c, c> per cell
+    offsets: Vec<usize>, // nlist + 1
     ids: Vec<u64>,
-    signs: Vec<u64>,      // count * words
+    signs: Vec<u64>, // count * words
     popcnt: Vec<u32>,
-    res_sq: Vec<f32>,     // ||v - c_cell||^2
-    coef: Vec<f32>,       // ||r||^2 / sum|r_i|
-    oc: Vec<f32>,         // <v, c_cell>
+    res_sq: Vec<f32>, // ||v - c_cell||^2
+    coef: Vec<f32>,   // ||r||^2 / sum|r_i|
+    oc: Vec<f32>,     // <v, c_cell>
     raw: Option<Vec<f32>>,
 }
 
@@ -643,7 +646,10 @@ mod tests {
         let items = (0..n)
             .map(|i| {
                 let c = &centers[i % ncenters];
-                (i as u64, c.iter().map(|x| x + (next() - 0.5) * 0.2).collect())
+                (
+                    i as u64,
+                    c.iter().map(|x| x + (next() - 0.5) * 0.2).collect(),
+                )
             })
             .collect();
         (items, centers)
@@ -702,7 +708,10 @@ mod tests {
             }
         }
         let recall = hit as f64 / probes as f64;
-        assert!(recall >= 0.8, "estimator near-identity recall too low: {recall}");
+        assert!(
+            recall >= 0.8,
+            "estimator near-identity recall too low: {recall}"
+        );
     }
 
     #[test]
@@ -721,13 +730,27 @@ mod tests {
         for t in 0..40 {
             let c = &centers[t % centers.len()];
             let q: Vec<f32> = c.iter().map(|x| x + 0.03).collect();
-            let truth: std::collections::HashSet<u64> =
-                truth_idx.search_exact(&q, 10).iter().map(|h| h.id).collect();
-            flat_hit += flat.search(&q, 10, 1).iter().filter(|h| truth.contains(&h.id)).count();
-            ivf_hit += ivf.search(&q, 10, 8, 1).iter().filter(|h| truth.contains(&h.id)).count();
+            let truth: std::collections::HashSet<u64> = truth_idx
+                .search_exact(&q, 10)
+                .iter()
+                .map(|h| h.id)
+                .collect();
+            flat_hit += flat
+                .search(&q, 10, 1)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
+            ivf_hit += ivf
+                .search(&q, 10, 8, 1)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
             total += truth.len();
         }
-        let (fr, ir) = (flat_hit as f64 / total as f64, ivf_hit as f64 / total as f64);
+        let (fr, ir) = (
+            flat_hit as f64 / total as f64,
+            ivf_hit as f64 / total as f64,
+        );
         assert!(ir >= fr, "IVF+RaBitQ {ir} should beat flat RaBitQ {fr}");
     }
 
@@ -744,9 +767,16 @@ mod tests {
         for t in 0..40 {
             let c = &centers[t % centers.len()];
             let q: Vec<f32> = c.iter().map(|x| x + 0.01).collect();
-            let truth: std::collections::HashSet<u64> =
-                truth_idx.search_exact(&q, 10).iter().map(|h| h.id).collect();
-            hit += ivf.search(&q, 10, 8, 16).iter().filter(|h| truth.contains(&h.id)).count();
+            let truth: std::collections::HashSet<u64> = truth_idx
+                .search_exact(&q, 10)
+                .iter()
+                .map(|h| h.id)
+                .collect();
+            hit += ivf
+                .search(&q, 10, 8, 16)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
             total += truth.len();
         }
         let recall = hit as f64 / total as f64;

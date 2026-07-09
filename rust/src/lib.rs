@@ -20,16 +20,20 @@
 pub mod bin_quant;
 pub mod distance;
 pub mod hnsw;
+pub mod hnsw_q;
 pub mod index;
 pub mod ivf;
+pub mod pq;
 pub mod quantize;
 pub mod rabitq;
 pub mod storage;
 
 pub use bin_quant::BinaryIndex;
 pub use hnsw::HnswIndex;
+pub use hnsw_q::HnswQIndex;
 pub use index::{FlatIndex, Hit, Metric, View};
 pub use ivf::IvfIndex;
-pub use rabitq::{IvfRabitqIndex, RabitqIndex};
+pub use pq::PqIndex;
 pub use quantize::{quantize, Quantized};
+pub use rabitq::{IvfRabitqIndex, RabitqIndex};
 pub use storage::{load, open, save, MmapIndex};

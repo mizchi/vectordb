@@ -3,9 +3,7 @@
 //! Run with: `cargo run --release --example bench`
 
 use std::time::Instant;
-use vectordb::{
-    BinaryIndex, FlatIndex, HnswIndex, IvfIndex, IvfRabitqIndex, Metric, RabitqIndex,
-};
+use vectordb::{BinaryIndex, FlatIndex, HnswIndex, IvfIndex, IvfRabitqIndex, Metric, RabitqIndex};
 
 fn main() {
     let n = 50_000usize;
@@ -25,7 +23,9 @@ fn main() {
         .map(|_| (0..dim).map(|_| rng.next_f32() * 2.0 - 1.0).collect())
         .collect();
     let jitter = |rng: &mut Rng, c: &[f32]| -> Vec<f32> {
-        c.iter().map(|x| x + (rng.next_f32() * 2.0 - 1.0) * noise).collect()
+        c.iter()
+            .map(|x| x + (rng.next_f32() * 2.0 - 1.0) * noise)
+            .collect()
     };
     let items: Vec<(u64, Vec<f32>)> = (0..n)
         .map(|i| {
@@ -83,9 +83,18 @@ fn main() {
     let recall = hits as f64 / total as f64;
 
     let per_query = |d: std::time::Duration| d.as_secs_f64() * 1e3 / queries as f64;
-    println!("int8+rerank(o={oversample}): {:.3} ms/query", per_query(approx_dur));
-    println!("int8 only:                  {:.3} ms/query", per_query(int8_dur));
-    println!("exact f32:                  {:.3} ms/query", per_query(exact_dur));
+    println!(
+        "int8+rerank(o={oversample}): {:.3} ms/query",
+        per_query(approx_dur)
+    );
+    println!(
+        "int8 only:                  {:.3} ms/query",
+        per_query(int8_dur)
+    );
+    println!(
+        "exact f32:                  {:.3} ms/query",
+        per_query(exact_dur)
+    );
     println!("recall@{k}: {:.4}", recall);
     println!(
         "footprint: int8 codes {} MiB vs f32 {} MiB (raw kept for rerank)",
@@ -127,7 +136,10 @@ fn main() {
     let t = Instant::now();
     let ivf = IvfIndex::build(dim, Metric::Cosine, nlist, &items, true, 12);
     let ivf_build = t.elapsed();
-    println!("--- IVF (nlist={nlist}, built in {:.2}s) vs flat exact ---", ivf_build.as_secs_f64());
+    println!(
+        "--- IVF (nlist={nlist}, built in {:.2}s) vs flat exact ---",
+        ivf_build.as_secs_f64()
+    );
 
     let recall_of = |results: &[Vec<vectordb::Hit>]| -> f64 {
         let mut h = 0usize;
@@ -142,8 +154,10 @@ fn main() {
 
     for &nprobe in &[1usize, 4, 8, 16, 32] {
         let t = Instant::now();
-        let results: Vec<Vec<vectordb::Hit>> =
-            qs.iter().map(|q| ivf.search(q, k, nprobe, oversample)).collect();
+        let results: Vec<Vec<vectordb::Hit>> = qs
+            .iter()
+            .map(|q| ivf.search(q, k, nprobe, oversample))
+            .collect();
         let dur = t.elapsed();
         println!(
             "nprobe={nprobe:<3} {:.3} ms/query  recall@{k}={:.4}  ({:.1}x vs flat int8+rerank)",
@@ -156,8 +170,7 @@ fn main() {
     // ---- Binary (1-bit) quantization + rerank ----
     let bin = BinaryIndex::build(dim, Metric::Cosine, &items, true);
     let t = Instant::now();
-    let bin_results: Vec<Vec<vectordb::Hit>> =
-        qs.iter().map(|q| bin.search(q, k, 16)).collect();
+    let bin_results: Vec<Vec<vectordb::Hit>> = qs.iter().map(|q| bin.search(q, k, 16)).collect();
     let bin_dur = t.elapsed();
     println!(
         "--- binary 1-bit (codes {} KiB = 1/32 of f32) ---",
@@ -201,8 +214,7 @@ fn main() {
     // here, since 1-bit estimates are coarser than int8 — sweep oversample.
     for &o in &[8usize, 16, 32, 64] {
         let t = Instant::now();
-        let res: Vec<Vec<vectordb::Hit>> =
-            qs.iter().map(|q| ivfrq.search(q, k, 16, o)).collect();
+        let res: Vec<Vec<vectordb::Hit>> = qs.iter().map(|q| ivfrq.search(q, k, 16, o)).collect();
         let dur = t.elapsed();
         println!(
             "nprobe=16 oversample={o:<3} {:.3} ms/query  recall@{k}={:.4}",

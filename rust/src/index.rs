@@ -194,7 +194,14 @@ impl<'a> View<'a> {
             if !self.live(i) || !filter(self.ids[i]) {
                 continue;
             }
-            push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
+            push_bounded(
+                &mut heap,
+                Ranked {
+                    key: self.approx_key_at(i, q),
+                    idx: i,
+                },
+                cand_n,
+            );
         }
         heap
     }
@@ -214,7 +221,14 @@ impl<'a> View<'a> {
                 || BinaryHeap::with_capacity(cand_n + 1),
                 |mut heap, i| {
                     if self.live(i) && filter(self.ids[i]) {
-                        push_bounded(&mut heap, Ranked { key: self.approx_key_at(i, q), idx: i }, cand_n);
+                        push_bounded(
+                            &mut heap,
+                            Ranked {
+                                key: self.approx_key_at(i, q),
+                                idx: i,
+                            },
+                            cand_n,
+                        );
                     }
                     heap
                 },
@@ -420,7 +434,10 @@ impl FlatIndex {
         let mut codes = Vec::with_capacity(self.live_len() * dim);
         let mut scales = Vec::with_capacity(self.live_len());
         let mut sqnorms = Vec::with_capacity(self.live_len());
-        let mut raw = self.raw.as_ref().map(|_| Vec::with_capacity(self.live_len() * dim));
+        let mut raw = self
+            .raw
+            .as_ref()
+            .map(|_| Vec::with_capacity(self.live_len() * dim));
         let mut payloads = Vec::with_capacity(self.live_len());
         for i in 0..self.ids.len() {
             if self.deleted[i] {
@@ -667,7 +684,11 @@ mod tests {
         let q: Vec<f32> = (0..dim).map(|_| next()).collect();
 
         let serial: Vec<u64> = idx.search(&q, 10, 8).iter().map(|h| h.id).collect();
-        let parallel: Vec<u64> = idx.search_parallel(&q, 10, 8).iter().map(|h| h.id).collect();
+        let parallel: Vec<u64> = idx
+            .search_parallel(&q, 10, 8)
+            .iter()
+            .map(|h| h.id)
+            .collect();
         assert_eq!(serial, parallel);
 
         let qs = vec![q.clone(), q.clone(), q.clone()];
@@ -745,7 +766,10 @@ mod tests {
         let hits = idx.search(&[1.0, 0.0, 0.0, 0.0], 4, 4);
         assert!(hits.iter().all(|h| h.id != 10));
         assert_eq!(hits[0].id, 30); // next nearest
-        assert!(idx.search_exact(&[1.0, 0.0, 0.0, 0.0], 4).iter().all(|h| h.id != 10));
+        assert!(idx
+            .search_exact(&[1.0, 0.0, 0.0, 0.0], 4)
+            .iter()
+            .all(|h| h.id != 10));
 
         // Compaction drops the tombstone but keeps results identical.
         idx.compact();
