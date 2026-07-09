@@ -273,10 +273,11 @@ fallback を持つため `native` / `wasm` / `wasm-gc` / `js` すべてで動く
 
 ```bash
 cd moonbit
-moon test              # 8 tests（既定 = wasm。距離・量子化・検索・recall）
+moon test              # 全インデックス/量子化のテスト（既定 = wasm）
 moon run cmd/main      # デモ
-moon run cmd/bench --release   # ベンチ（Rustと同条件, n=50k）
-# 他バックエンドで動かす場合は --target native / wasm-gc / js を明示
+moon run cmd/bench --target native --release   # 全索引の統合ベンチ（recall/ms/query）
+# cmd/bench は Flat/IVF/HNSW/int8-HNSW/PQ/IVF+PQ/OPQ を横断計測。graph 索引の
+# 構築が重いので統合ベンチは native 推奨（wasm は scan 系の SIMD 計測向き）。
 ```
 
 ### バックエンド別の速度メモ（int8 only / exact f32, ms/query, 参考値）

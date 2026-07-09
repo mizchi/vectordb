@@ -1,0 +1,345 @@
+<title>vectordb — compact vector search</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f0f2f6;
+  --ink:#0f1720; --mute:#5b6673; --faint:#8a94a1;
+  --line:#e2e6ec; --line-2:#d3d9e2;
+  --accent:#2f6df6; --accent-soft:#e7eefe;
+  --recall:#12a594; --qps:#e0870c;
+  --shadow:0 1px 2px rgba(15,23,32,.04),0 8px 24px rgba(15,23,32,.06);
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0c1016; --panel:#131a22; --panel-2:#0f151c;
+    --ink:#e6ebf1; --mute:#9aa6b4; --faint:#6a7482;
+    --line:#222c38; --line-2:#2c3846;
+    --accent:#5b8cff; --accent-soft:#16233c;
+    --recall:#2dd4bf; --qps:#f5b445;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0c1016; --panel:#131a22; --panel-2:#0f151c;
+  --ink:#e6ebf1; --mute:#9aa6b4; --faint:#6a7482;
+  --line:#222c38; --line-2:#2c3846;
+  --accent:#5b8cff; --accent-soft:#16233c;
+  --recall:#2dd4bf; --qps:#f5b445;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
+}
+:root[data-theme="light"]{
+  --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f0f2f6;
+  --ink:#0f1720; --mute:#5b6673; --faint:#8a94a1;
+  --line:#e2e6ec; --line-2:#d3d9e2;
+  --accent:#2f6df6; --accent-soft:#e7eefe;
+  --recall:#12a594; --qps:#e0870c;
+  --shadow:0 1px 2px rgba(15,23,32,.04),0 8px 24px rgba(15,23,32,.06);
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font-family:var(--sans);line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+a{color:var(--accent);text-decoration:none}
+.mono{font-family:var(--mono)}
+.eyebrow{
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.18em;
+  text-transform:uppercase;color:var(--accent);font-weight:600;
+}
+h1,h2,h3{text-wrap:balance;letter-spacing:-.02em;font-weight:750;margin:0}
+section{padding:46px 0;border-top:1px solid var(--line)}
+.sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:26px;flex-wrap:wrap}
+.sec-head h2{font-size:22px}
+.sec-head .n{font-family:var(--mono);color:var(--faint);font-size:13px}
+.lead{color:var(--mute);max-width:64ch}
+
+/* top bar */
+.topbar{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.topbar .row{display:flex;align-items:center;justify-content:space-between;height:52px}
+.brand{font-family:var(--mono);font-weight:600;font-size:14px;letter-spacing:-.01em}
+.brand .dot{color:var(--accent)}
+.toggle{font-family:var(--mono);font-size:12px;color:var(--mute);background:var(--panel);
+  border:1px solid var(--line-2);border-radius:999px;padding:6px 13px;cursor:pointer}
+.toggle:hover{border-color:var(--accent);color:var(--ink)}
+.toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* hero */
+.hero{padding:64px 0 40px;border-top:none}
+.hero h1{font-size:clamp(34px,6vw,58px);line-height:1.02}
+.hero h1 .g{color:var(--accent)}
+.hero p{font-size:18px;color:var(--mute);max-width:60ch;margin:20px 0 0}
+.badges{display:flex;gap:8px;flex-wrap:wrap;margin-top:26px}
+.badge{font-family:var(--mono);font-size:12px;color:var(--mute);
+  border:1px solid var(--line-2);border-radius:7px;padding:5px 10px;background:var(--panel)}
+.badge b{color:var(--ink);font-weight:600}
+
+/* stat tiles */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 18px 16px;box-shadow:var(--shadow)}
+.tile .v{font-family:var(--mono);font-size:30px;font-weight:650;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.tile .l{font-size:12.5px;color:var(--mute);margin-top:4px}
+.tile .v small{font-size:15px;color:var(--faint);font-weight:500}
+
+/* pipeline */
+.pipe{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.step{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:16px;position:relative;box-shadow:var(--shadow)}
+.step + .step{margin-left:26px}
+.step + .step::before{content:"→";position:absolute;left:-21px;top:50%;transform:translateY(-50%);
+  color:var(--accent);font-family:var(--mono);font-size:15px}
+.step .k{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
+.step .t{font-weight:650;margin-top:7px;font-size:15px}
+.step .d{color:var(--mute);font-size:13px;margin-top:4px}
+
+/* catalog cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 17px;box-shadow:var(--shadow)}
+.card h3{font-size:15px;font-family:var(--mono);letter-spacing:-.01em}
+.card .tag{float:right;font-family:var(--mono);font-size:10.5px;color:var(--accent);
+  background:var(--accent-soft);border-radius:5px;padding:2px 7px;letter-spacing:.02em}
+.card p{color:var(--mute);font-size:13px;margin:8px 0 0}
+
+/* benchmark table */
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:var(--shadow)}
+table{border-collapse:collapse;width:100%;min-width:620px}
+th,td{text-align:left;padding:11px 14px;font-size:13.5px;border-bottom:1px solid var(--line)}
+thead th{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);font-weight:600;background:var(--panel-2)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--panel-2)}
+td.name{font-weight:600}
+td.name .sub{display:block;font-family:var(--mono);font-size:11px;color:var(--faint);font-weight:400}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.bar{position:relative;min-width:132px}
+.bar .track{height:8px;border-radius:4px;background:var(--panel-2);overflow:hidden}
+.bar .fill{height:100%;border-radius:4px}
+.bar.r .fill{background:var(--recall)}
+.bar.q .fill{background:var(--qps)}
+.bar .cap{font-family:var(--mono);font-size:11px;color:var(--mute);font-variant-numeric:tabular-nums;margin-top:3px;display:block}
+.legend{display:flex;gap:18px;margin:0 0 16px;font-family:var(--mono);font-size:12px;color:var(--mute);flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.note{color:var(--faint);font-size:12px;margin-top:12px;font-family:var(--mono)}
+
+/* parity matrix */
+.matrix{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:var(--shadow)}
+.matrix table{min-width:520px}
+.matrix td.feat{font-size:13.5px}
+.matrix .cell{text-align:center;font-family:var(--mono);font-weight:600}
+.yes{color:var(--recall)}
+.no{color:var(--faint)}
+.partial{color:var(--qps)}
+.matrix .detail{font-family:var(--mono);font-size:11px;color:var(--faint);text-align:center;font-weight:400}
+.colhead{text-align:center !important}
+
+/* format strip */
+.fmt{display:flex;gap:10px;flex-wrap:wrap}
+.fmt .blk{flex:1;min-width:110px;background:var(--panel);border:1px solid var(--line);
+  border-radius:9px;padding:12px 13px;box-shadow:var(--shadow)}
+.fmt .blk .m{font-family:var(--mono);font-size:12px;color:var(--accent)}
+.fmt .blk .s{font-size:12px;color:var(--mute);margin-top:3px}
+
+footer{padding:40px 0 60px;border-top:1px solid var(--line);color:var(--faint);font-size:13px}
+footer .mono{font-size:12px}
+
+@media (max-width:640px){
+  .step + .step{margin-left:0;margin-top:26px}
+  .step + .step::before{content:"↓";left:50%;top:-21px;transform:translateX(-50%)}
+}
+@media (prefers-reduced-motion:no-preference){
+  .fill{transition:width .9s cubic-bezier(.2,.7,.2,1)}
+}
+</style>
+
+<div class="topbar"><div class="wrap row">
+  <span class="brand">mizchi/vectordb<span class="dot">.</span></span>
+  <button class="toggle" id="tg" aria-label="Toggle color theme">◐ theme</button>
+</div></div>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">Rust&nbsp;·&nbsp;MoonBit&nbsp;·&nbsp;single-file&nbsp;.vecdb</div>
+    <h1>A compact, embeddable<br><span class="g">vector-search</span> database.</h1>
+    <p>Brute-force to graph indexes over a shared SIMD distance core and a
+       quantize&nbsp;→&nbsp;scan&nbsp;→&nbsp;rerank pipeline — implemented twice, in Rust
+       (primary) and MoonBit (wasm/v128 prototype), reading and writing the same file format.</p>
+    <div class="badges">
+      <span class="badge"><b>4</b> index types</span>
+      <span class="badge"><b>7</b> quantizers</span>
+      <span class="badge">up to <b>32×</b> compression</span>
+      <span class="badge">recall@10 <b>1.00</b> on SIFT10K</span>
+      <span class="badge">zero deps beyond <b>memmap2 · rayon</b></span>
+    </div>
+  </header>
+
+  <section style="border-top:none;padding-top:8px">
+    <div class="tiles">
+      <div class="tile"><div class="v">4</div><div class="l">Indexes — Flat · IVF · HNSW · int8-HNSW</div></div>
+      <div class="tile"><div class="v">7</div><div class="l">Quantizers — int8 · binary · RaBitQ · IVF+RaBitQ · PQ · IVF+PQ · OPQ</div></div>
+      <div class="tile"><div class="v">90</div><div class="l">Tests passing <small>· 58 Rust + 32 MoonBit</small></div></div>
+      <div class="tile"><div class="v">40k<small>&nbsp;qps</small></div><div class="l">Peak throughput on SIFT10K (HNSW, recall 0.994)</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><div class="n">01</div><h2>The search pipeline</h2></div>
+    <p class="lead" style="margin-bottom:24px">Every index shares one path: compress vectors to a small code for a fast
+       approximate scan, keep the best <span class="mono">k·oversample</span> candidates, then re-score those with exact
+       full-precision distances. Coarse selection is cheap; accuracy is recovered on a tiny shortlist.</p>
+    <div class="pipe">
+      <div class="step"><div class="k">encode</div><div class="t">Quantize</div><div class="d">f32 → int8 / 1-bit / PQ codes. 4×–32× smaller, cache-friendly.</div></div>
+      <div class="step"><div class="k">scan</div><div class="t">Approx distance</div><div class="d">SIMD dot/L2 over codes (AVX2 · wasm v128), bounded top-k heap.</div></div>
+      <div class="step"><div class="k">refine</div><div class="t">Rerank</div><div class="d">Re-score the shortlist with exact f32 → final top-k.</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><div class="n">02</div><h2>Indexes</h2><span class="lead" style="flex:1;min-width:200px">how candidates are narrowed before scanning</span></div>
+    <div class="grid">
+      <div class="card"><span class="tag">exact-ish</span><h3>Flat</h3><p>Brute-force int8 scan + f32 rerank. Simple, SIMD-bound, recall 1.0 to hundreds of thousands of vectors.</p></div>
+      <div class="card"><span class="tag">nprobe</span><h3>IVF</h3><p>k-means++ cells; scan only the <span class="mono">nprobe</span> nearest. Best recall/throughput balance.</p></div>
+      <div class="card"><span class="tag">graph</span><h3>HNSW</h3><p>Multi-layer proximity graph with the diversity heuristic. Highest throughput at high recall.</p></div>
+      <div class="card"><span class="tag">graph · ¼ mem</span><h3>int8-HNSW</h3><p>Same graph, int8 nodes (~¼ the vector memory). Built &amp; searched in quantized space, f32-reranked.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><div class="n">03</div><h2>Quantizers</h2><span class="lead" style="flex:1;min-width:200px">how each vector is compressed</span></div>
+    <div class="grid">
+      <div class="card"><span class="tag">4×</span><h3>int8 scalar</h3><p>Per-vector symmetric quantization. The safe default — recall stays ~1.0 with rerank.</p></div>
+      <div class="card"><span class="tag">32×</span><h3>binary 1-bit</h3><p>Sign bits + Hamming. Collapses on non-negative data — a cautionary baseline for RaBitQ.</p></div>
+      <div class="card"><span class="tag">32×</span><h3>RaBitQ</h3><p>Rotation + sign code + an unbiased inner-product estimator. 1-bit storage, far higher recall.</p></div>
+      <div class="card"><span class="tag">32×</span><h3>IVF+RaBitQ</h3><p>Per-cell centroids keep residuals tight — where RaBitQ's estimator shines.</p></div>
+      <div class="card"><span class="tag">up to 32×</span><h3>PQ</h3><p>Subspace split + per-subspace codebooks + ADC lookup-table scan. 16 bytes/vector at m=16.</p></div>
+      <div class="card"><span class="tag">32×</span><h3>IVF+PQ</h3><p>Residual PQ per cell — the classic billion-scale index. Tight codes, high recall.</p></div>
+      <div class="card"><span class="tag">rotated</span><h3>OPQ</h3><p>Learned orthonormal rotation (self-contained Jacobi SVD) balances subspaces before PQ.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><div class="n">04</div><h2>Benchmark — ANN_SIFT10K</h2><span class="n">10k×128 · L2 · k=10 · Rust/AVX2</span></div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--recall)"></i> recall@10 (of 1.0)</span>
+      <span><i class="sw" style="background:var(--qps)"></i> throughput (queries/sec)</span>
+      <span style="color:var(--faint)">bars scale to the best value in each column</span>
+    </div>
+    <div class="tablewrap">
+      <table id="bench">
+        <thead><tr>
+          <th>Method</th>
+          <th style="min-width:150px">recall@10</th>
+          <th style="min-width:150px">throughput</th>
+          <th class="num">ms/query</th>
+        </tr></thead>
+        <tbody><!-- rows injected --></tbody>
+      </table>
+    </div>
+    <p class="note">Reproduce: <span style="color:var(--accent)">cargo run --release --example eval -- siftsmall</span>. Shared-CPU run; absolute qps varies, the ordering is stable.</p>
+  </section>
+
+  <section>
+    <div class="sec-head"><div class="n">05</div><h2>Rust ↔ MoonBit parity</h2><span class="lead" style="flex:1;min-width:200px">two implementations, one <span class="mono">.vecdb</span> format</span></div>
+    <div class="matrix">
+      <table>
+        <thead><tr>
+          <th>Capability</th><th class="colhead">Rust</th><th class="colhead">MoonBit</th><th class="colhead">Notes</th>
+        </tr></thead>
+        <tbody id="parity"><!-- rows injected --></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><div class="n">06</div><h2>Persistence — <span class="mono">.vecdb</span></h2><span class="lead" style="flex:1;min-width:200px">one little-endian file, 16-byte-aligned sections, mmap zero-copy load</span></div>
+    <div class="fmt">
+      <div class="blk"><div class="m">VECDB1</div><div class="s">Flat — ids · scales · codes · raw · tombstones · payloads</div></div>
+      <div class="blk"><div class="m">VECDBIV1</div><div class="s">IVF — centroids · CSR cells</div></div>
+      <div class="blk"><div class="m">VECDBHN1</div><div class="s">HNSW — vectors · graph links</div></div>
+      <div class="blk"><div class="m">VECDBHQ1</div><div class="s">int8-HNSW</div></div>
+      <div class="blk"><div class="m">VECDBPQ1</div><div class="s">PQ — codebooks · codes</div></div>
+      <div class="blk"><div class="m">VECDBIP1</div><div class="s">IVF+PQ</div></div>
+      <div class="blk"><div class="m">VECDBOP1</div><div class="s">OPQ — rotation · codebooks</div></div>
+    </div>
+    <p class="note">Optional sections are flag-gated: an index with no tombstones/payloads is byte-identical to the base format, so a Rust-written file and a MoonBit-written file agree byte-for-byte for the deterministic Flat layout.</p>
+  </section>
+
+  <footer>
+    <div>Compact vector search, dual-implemented. Full research notes, format spec, and staged design in
+      <span class="mono">DESIGN.md</span>; usage and benchmarks in <span class="mono">README.md</span>.</div>
+    <div class="mono" style="margin-top:8px">MIT OR Apache-2.0</div>
+  </footer>
+
+</div>
+
+<script>
+// --- benchmark rows (real SIFT10K numbers, Rust/AVX2) ---
+const rows = [
+  ["flat exact f32","reference",1.000,0.26,3800],
+  ["flat int8 + rerank","o=8",1.000,0.14,7300],
+  ["binary 1-bit + rerank","o=32",0.037,0.05,18800],
+  ["RaBitQ flat + rerank","o=32",0.999,0.31,3200],
+  ["PQ  m=16","o=32 · 16 B/vec",1.000,0.21,4800],
+  ["OPQ m=16","o=32 · rotated",1.000,0.24,4100],
+  ["IVF  nprobe=16","o=8",0.991,0.051,19400],
+  ["IVF+RaBitQ nprobe=16","o=32",0.991,0.29,3500],
+  ["IVF+PQ nprobe=16","o=16",0.991,0.40,2500],
+  ["HNSW efSearch=32","graph",0.994,0.031,31900],
+  ["HNSW efSearch=128","graph",1.000,0.093,10800],
+  ["int8-HNSW efSearch=64","¼ mem",0.997,0.042,23900],
+];
+const maxQ = Math.max(...rows.map(r=>r[4]));
+const tb = document.querySelector("#bench tbody");
+for(const [name,sub,rec,ms,qps] of rows){
+  const tr=document.createElement("tr");
+  const recPct=(rec*100).toFixed(1)+"%";
+  const qk=(qps/1000).toFixed(1)+"k";
+  tr.innerHTML=`
+    <td class="name">${name}<span class="sub">${sub}</span></td>
+    <td class="bar r"><div class="track"><div class="fill" style="width:0"></div></div><span class="cap">${recPct}</span></td>
+    <td class="bar q"><div class="track"><div class="fill" style="width:0"></div></div><span class="cap">${qk} q/s</span></td>
+    <td class="num">${ms.toFixed(3)}</td>`;
+  tb.appendChild(tr);
+  tr.querySelector(".r .fill").dataset.w=(rec*100)+"%";
+  tr.querySelector(".q .fill").dataset.w=(qps/maxQ*100)+"%";
+}
+// animate fills in after paint
+requestAnimationFrame(()=>requestAnimationFrame(()=>{
+  document.querySelectorAll(".fill").forEach(f=>{ if(f.dataset.w) f.style.width=f.dataset.w; });
+}));
+
+// --- parity matrix ---
+const Y='<span class="yes">●</span>', N='<span class="no">○</span>', P='<span class="partial">◑</span>';
+const parity = [
+  ["Flat / IVF / HNSW indexes",Y,Y,"identical algorithms"],
+  ["int8-HNSW (¼-mem graph)",Y,Y,""],
+  ["int8 · binary · RaBitQ · IVF+RaBitQ",Y,Y,""],
+  ["PQ · IVF+PQ · OPQ",Y,Y,"OPQ ships a Jacobi SVD"],
+  ["Filtered search (all indexes)",Y,Y,"predicate on id"],
+  [".vecdb save / load",Y,Y,"shared byte layout"],
+  ["Soft-delete + compact",Y,N,"Flat/IVF/HNSW (Rust)"],
+  ["Tombstone / payload persistence",Y,N,""],
+  ["SIMD distance kernels",Y,Y,"AVX2 · wasm v128"],
+  ["rayon parallel · mmap zero-copy",Y,N,"wasm has no threads/FS"],
+];
+const pb=document.querySelector("#parity");
+for(const [f,r,m,note] of parity){
+  const tr=document.createElement("tr");
+  tr.innerHTML=`<td class="feat">${f}</td><td class="cell">${r}</td><td class="cell">${m}</td><td class="detail">${note}</td>`;
+  pb.appendChild(tr);
+}
+
+// --- theme toggle ---
+const tg=document.getElementById("tg");
+tg.addEventListener("click",()=>{
+  const cur=document.documentElement.getAttribute("data-theme");
+  const next = cur==="dark" ? "light" : cur==="light" ? "dark"
+    : (matchMedia("(prefers-color-scheme:dark)").matches ? "light" : "dark");
+  document.documentElement.setAttribute("data-theme",next);
+});
+</script>
