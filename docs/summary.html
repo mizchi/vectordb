@@ -170,7 +170,7 @@ footer .mono{font-size:12px}
        quantize&nbsp;→&nbsp;scan&nbsp;→&nbsp;rerank pipeline — implemented twice, in Rust
        (primary) and MoonBit (wasm/v128 prototype), reading and writing the same file format.</p>
     <div class="badges">
-      <span class="badge"><b>4</b> index types</span>
+      <span class="badge"><b>5</b> index types</span>
       <span class="badge"><b>7</b> quantizers</span>
       <span class="badge">up to <b>32×</b> compression</span>
       <span class="badge">recall@10 <b>1.00</b> on SIFT10K</span>
@@ -180,7 +180,7 @@ footer .mono{font-size:12px}
 
   <section style="border-top:none;padding-top:8px">
     <div class="tiles">
-      <div class="tile"><div class="v">4</div><div class="l">Indexes — Flat · IVF · HNSW · int8-HNSW</div></div>
+      <div class="tile"><div class="v">5</div><div class="l">Indexes — Flat · IVF · HNSW · int8-HNSW · DiskANN</div></div>
       <div class="tile"><div class="v">7</div><div class="l">Quantizers — int8 · binary · RaBitQ · IVF+RaBitQ · PQ · IVF+PQ · OPQ</div></div>
       <div class="tile"><div class="v">90</div><div class="l">Tests passing <small>· 58 Rust + 32 MoonBit</small></div></div>
       <div class="tile"><div class="v">40k<small>&nbsp;qps</small></div><div class="l">Peak throughput on SIFT10K (HNSW, recall 0.994)</div></div>
@@ -206,6 +206,7 @@ footer .mono{font-size:12px}
       <div class="card"><span class="tag">nprobe</span><h3>IVF</h3><p>k-means++ cells; scan only the <span class="mono">nprobe</span> nearest. Best recall/throughput balance.</p></div>
       <div class="card"><span class="tag">graph</span><h3>HNSW</h3><p>Multi-layer proximity graph with the diversity heuristic. Highest throughput at high recall.</p></div>
       <div class="card"><span class="tag">graph · ¼ mem</span><h3>int8-HNSW</h3><p>Same graph, int8 nodes (~¼ the vector memory). Built &amp; searched in quantized space, f32-reranked.</p></div>
+      <div class="card"><span class="tag">single-layer · SSD</span><h3>DiskANN</h3><p>Vamana graph with RobustPrune. PQ codes resident in RAM steer traversal; raw f32 read only to rerank. Built for scale.</p></div>
     </div>
   </section>
 
@@ -265,6 +266,7 @@ footer .mono{font-size:12px}
       <div class="blk"><div class="m">VECDBPQ1</div><div class="s">PQ — codebooks · codes</div></div>
       <div class="blk"><div class="m">VECDBIP1</div><div class="s">IVF+PQ</div></div>
       <div class="blk"><div class="m">VECDBOP1</div><div class="s">OPQ — rotation · codebooks</div></div>
+      <div class="blk"><div class="m">VECDBDA1</div><div class="s">DiskANN — CSR graph · PQ · raw</div></div>
     </div>
     <p class="note">Optional sections are flag-gated: an index with no tombstones/payloads is byte-identical to the base format, so a Rust-written file and a MoonBit-written file agree byte-for-byte for the deterministic Flat layout.</p>
   </section>
@@ -292,6 +294,7 @@ const rows = [
   ["HNSW efSearch=32","graph",0.994,0.031,31900],
   ["HNSW efSearch=128","graph",1.000,0.093,10800],
   ["int8-HNSW efSearch=64","¼ mem",0.997,0.042,23900],
+  ["DiskANN L=64","vamana",0.999,0.186,5400],
 ];
 const maxQ = Math.max(...rows.map(r=>r[4]));
 const tb = document.querySelector("#bench tbody");
@@ -318,6 +321,7 @@ const Y='<span class="yes">●</span>', N='<span class="no">○</span>', P='<spa
 const parity = [
   ["Flat / IVF / HNSW indexes",Y,Y,"identical algorithms"],
   ["int8-HNSW (¼-mem graph)",Y,Y,""],
+  ["DiskANN / Vamana",Y,N,"Rust only (minimal)"],
   ["int8 · binary · RaBitQ · IVF+RaBitQ",Y,Y,""],
   ["PQ · IVF+PQ · OPQ",Y,Y,"OPQ ships a Jacobi SVD"],
   ["Filtered search (all indexes)",Y,Y,"predicate on id"],

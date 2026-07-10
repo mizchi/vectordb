@@ -36,12 +36,14 @@ $V build-hnsw-q vecs.csv hnswq.vecdb --metric cosine        # int8グラフHNSW�
 $V build-pq     vecs.csv pq.vecdb    --metric cosine --pq-m 16 --ksub 256  # Product Quantization
 $V build-opq    vecs.csv opq.vecdb   --metric cosine --pq-m 16 --opq-iters 4  # 回転付きPQ
 $V build-ivfpq  vecs.csv ivfpq.vecdb --metric cosine --nlist 256 --pq-m 16    # IVF+PQ
+$V build-diskann vecs.csv da.vecdb   --metric cosine -r 32 --alpha 1.2        # DiskANN/Vamana
 $V info   hnsw.vecdb
 $V search flat.vecdb  query.csv -k 10 --oversample 4
 $V search ivf.vecdb   query.csv -k 10 --nprobe 16
 $V search hnsw.vecdb  query.csv -k 10 --ef 64
 $V search pq.vecdb    query.csv -k 10 --oversample 8
 $V search ivfpq.vecdb query.csv -k 10 --nprobe 16 --oversample 16
+$V search da.vecdb    query.csv -k 10 --ef 64   # --ef = l_search
 # 最小サイズ（rerankなし）: build 系の各コマンドに --compact
 ```
 
@@ -248,6 +250,26 @@ let hits = idx.search(&query, 10, /*ef_search=*/96);   // rerank付きで高reca
 idx.save("graph.hnswq.vecdb")?;                        // magic VECDBHQ1
 ```
 
+### DiskANN / Vamana（`diskann.rs` の `DiskAnnIndex`）
+
+大規模・省メモリ向けの **単層グラフ**（Vamana, Subramanya et al. 2019）。HNSW の階層を捨て、
+`RobustPrune`（α>1 の枝刈りで遠距離ショートカットを残す）で少ホップ到達を狙う。**PQ コードは
+RAM 常駐**でグラフ探索の近似距離に使い（1ホップ=テーブル参照1回）、**生 f32 は "ディスク層"**
+として最終 rerank でのみ読む。グラフ幾何と PQ は processed 空間の L2 に統一し、metric は最終
+スコアだけに効く（cosine は正規化で L2 と等価）。
+
+```rust
+use vectordb::{DiskAnnIndex, Metric};
+// (items, metric, R=最大次数, l_build, alpha, pq_m, ksub)
+let idx = DiskAnnIndex::build(&items, Metric::L2, 32, 96, 1.2, 16, 256);
+let hits = idx.search(&query, 10, /*l_search=*/64);
+idx.save("index.diskann.vecdb")?;              // magic VECDBDA1
+```
+
+最小版として **in-memory 構築 + owned/reload ストレージ**。DiskANN 本来の価値は「RAM に載らない
+十億件を SSD で」だが、その構成要素（PQ 常駐・rerank・グラフ探索・mmap）は本 crate に揃っている。
+SIFT10K では L=64 で recall 0.999（HNSW が同規模では速い＝DiskANN は大規模向け、という素直な結果）。
+
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
 - `quantize.rs` — int8 スカラ量子化
@@ -260,6 +282,7 @@ idx.save("graph.hnswq.vecdb")?;                        // magic VECDBHQ1
 - `pq.rs` — Product Quantization（サブ空間分割 + ADC + rerank; 共有プリミティブ）
 - `opq.rs` — OPQ（学習回転 + PQ; 自作 Jacobi 固有値分解）
 - `ivf_pq.rs` — IVF+PQ（粗量子化 + 残差 PQ）
+- `diskann.rs` — DiskANN/Vamana（単層グラフ + RobustPrune + PQ 常駐 + rerank）
 - `storage.rs` — `.vecdb` の save / mmap open / load（tombstone/payload 永続化含む）
 
 ## MoonBit（試作）
@@ -502,6 +525,8 @@ cargo run --release --example eval -- siftsmall
 | HNSW efSearch=32 | 0.9940 | 0.031 | 31.9k |
 | HNSW efSearch=128 | 1.0000 | 0.093 | 10.8k |
 | HNSW-q(int8) efSearch=64 | 0.9970 | 0.042 | 23.9k |
+| DiskANN L=64 | 0.9990 | 0.186 | 5.4k |
+| DiskANN L=128 | 1.0000 | 0.366 | 2.7k |
 
 読み取れること（実データならでは）:
 - **int8+rerank は実データでも recall 1.0**。省メモリの安全な既定。
@@ -515,6 +540,8 @@ cargo run --release --example eval -- siftsmall
 - **int8 グラフ HNSW は f32 HNSW とほぼ同 recall/qps**（0.997 で 23.9k qps）を
   **ベクトル部 1/4 のメモリ**で達成。
 - **IVF** は recall/qps のバランスが良い（0.991 で 19.4k qps）。
+- **DiskANN は L=64 で recall 0.999**。in-memory 10k では HNSW の方が速い（PQ近似探索＋
+  rerank のオーバーヘッド分）——DiskANN の真価は RAM に載らない大規模を SSD で捌く領域。
 
 ## 段階的な拡張
 

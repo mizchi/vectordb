@@ -12,6 +12,7 @@
 //!   vecdb build-pq     <in.csv> <out.vecdb> [--metric m] [--pq-m M] [--ksub K] [--iters N] [--compact]
 //!   vecdb build-ivfpq  <in.csv> <out.vecdb> [--metric m] [--nlist N] [--pq-m M] [--ksub K] [--iters N] [--compact]
 //!   vecdb build-opq    <in.csv> <out.vecdb> [--metric m] [--pq-m M] [--ksub K] [--iters N] [--opq-iters N] [--compact]
+//!   vecdb build-diskann <in.csv> <out.vecdb> [--metric m] [-r R] [--l-build N] [--alpha A] [--pq-m M] [--ksub K]
 //!   vecdb search       <index.vecdb> <query.csv> [-k N] [--oversample M]
 //!                      [--nprobe N] [--ef N]   (index type auto-detected)
 //!   vecdb info         <index.vecdb>
@@ -19,7 +20,8 @@
 use std::io::Read;
 use std::process::ExitCode;
 use vectordb::{
-    save, FlatIndex, Hit, HnswIndex, HnswQIndex, IvfIndex, IvfPqIndex, Metric, OpqIndex, PqIndex,
+    save, DiskAnnIndex, FlatIndex, Hit, HnswIndex, HnswQIndex, IvfIndex, IvfPqIndex, Metric,
+    OpqIndex, PqIndex,
 };
 
 fn main() -> ExitCode {
@@ -34,11 +36,12 @@ fn main() -> ExitCode {
         Some("build-pq") => cmd_build_pq(rest),
         Some("build-ivfpq") => cmd_build_ivfpq(rest),
         Some("build-opq") => cmd_build_opq(rest),
+        Some("build-diskann") => cmd_build_diskann(rest),
         Some("search") => cmd_search(rest),
         Some("info") => cmd_info(rest),
         _ => {
             eprintln!(
-                "usage: vecdb <build|build-ivf|build-hnsw|build-hnsw-q|build-pq|build-ivfpq|build-opq|search|info> ..."
+                "usage: vecdb <build|build-ivf|build-hnsw|build-hnsw-q|build-pq|build-ivfpq|build-opq|build-diskann|search|info> ..."
             );
             return ExitCode::FAILURE;
         }
@@ -61,6 +64,7 @@ enum Kind {
     Pq,
     IvfPq,
     Opq,
+    DiskAnn,
 }
 
 fn detect(path: &str) -> Result<Kind, String> {
@@ -75,6 +79,7 @@ fn detect(path: &str) -> Result<Kind, String> {
         b"VECDBPQ1" => Ok(Kind::Pq),
         b"VECDBIP1" => Ok(Kind::IvfPq),
         b"VECDBOP1" => Ok(Kind::Opq),
+        b"VECDBDA1" => Ok(Kind::DiskAnn),
         _ => Err("unrecognized index file (bad magic)".into()),
     }
 }
@@ -281,6 +286,27 @@ fn cmd_build_opq(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_build_diskann(args: &[String]) -> Result<(), String> {
+    let (_, output, dim, records) = load_build_input(args)?;
+    let metric = flag_value(args, "--metric").map_or(Ok(Metric::Cosine), parse_metric)?;
+    let r: usize = parse_flag(args, "-r", 32)?;
+    let l_build: usize = parse_flag(args, "--l-build", 96)?;
+    let alpha: f32 = parse_flag(args, "--alpha", 1.2)?;
+    let pq_m: usize = parse_flag(args, "--pq-m", 16)?;
+    let ksub: usize = parse_flag(args, "--ksub", 256)?;
+    if !dim.is_multiple_of(pq_m) {
+        return Err(format!("--pq-m {pq_m} must divide dim {dim}"));
+    }
+    let idx = DiskAnnIndex::build(&records, metric, r, l_build, alpha, pq_m, ksub);
+    idx.save(&output).map_err(|e| e.to_string())?;
+    println!(
+        "built diskann: {} vectors (dim {dim}, {metric:?}, R {r}, avg-deg {:.1}) -> {output}",
+        idx.len(),
+        idx.avg_degree()
+    );
+    Ok(())
+}
+
 fn cmd_search(args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
         return Err(
@@ -339,6 +365,11 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
             let idx = OpqIndex::load(index_path).map_err(|e| e.to_string())?;
             check_dims(&qvs, idx.dim())?;
             qvs.iter().map(|v| idx.search(v, k, over)).collect()
+        }
+        Kind::DiskAnn => {
+            let idx = DiskAnnIndex::load(index_path).map_err(|e| e.to_string())?;
+            check_dims(&qvs, idx.dim())?;
+            qvs.iter().map(|v| idx.search(v, k, ef)).collect()
         }
     };
 
@@ -425,6 +456,15 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
             println!("dim:     {}", idx.dim());
             println!("metric:  {:?}", idx.metric());
             println!("raw f32: {}", idx.has_raw());
+        }
+        Kind::DiskAnn => {
+            let idx = DiskAnnIndex::load(path).map_err(|e| e.to_string())?;
+            println!("path:    {path}");
+            println!("type:    diskann (vamana)");
+            println!("count:   {}", idx.len());
+            println!("dim:     {}", idx.dim());
+            println!("metric:  {:?}", idx.metric());
+            println!("avg-deg: {:.1}", idx.avg_degree());
         }
     }
     Ok(())

@@ -12,8 +12,8 @@
 use std::path::Path;
 use std::time::Instant;
 use vectordb::{
-    BinaryIndex, FlatIndex, HnswIndex, HnswQIndex, IvfIndex, IvfPqIndex, IvfRabitqIndex, Metric,
-    OpqIndex, PqIndex, RabitqIndex,
+    BinaryIndex, DiskAnnIndex, FlatIndex, HnswIndex, HnswQIndex, IvfIndex, IvfPqIndex,
+    IvfRabitqIndex, Metric, OpqIndex, PqIndex, RabitqIndex,
 };
 
 type SearchFn<'a> = Box<dyn FnMut(&[f32]) -> Vec<vectordb::Hit> + 'a>;
@@ -206,6 +206,16 @@ fn main() {
         eval(
             &format!("HNSW-q(int8) efSearch={ef}"),
             Box::new(move |q| h.search(q, k, ef)),
+        );
+    }
+
+    // DiskANN / Vamana (single-layer graph; PQ-steered traversal + f32 rerank).
+    let diskann = DiskAnnIndex::build(&items, Metric::L2, 32, 96, 1.2, 16, 256);
+    for &l in &[32usize, 64, 128] {
+        let d = &diskann;
+        eval(
+            &format!("DiskANN L={l}"),
+            Box::new(move |q| d.search(q, k, l)),
         );
     }
 }

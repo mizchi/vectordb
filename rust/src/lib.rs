@@ -18,6 +18,7 @@
 //! ```
 
 pub mod bin_quant;
+pub mod diskann;
 pub mod distance;
 pub mod hnsw;
 pub mod hnsw_q;
@@ -31,6 +32,7 @@ pub mod rabitq;
 pub mod storage;
 
 pub use bin_quant::BinaryIndex;
+pub use diskann::DiskAnnIndex;
 pub use hnsw::HnswIndex;
 pub use hnsw_q::HnswQIndex;
 pub use index::{FlatIndex, Hit, Metric, View};
