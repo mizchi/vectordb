@@ -37,6 +37,7 @@ $V build-pq     vecs.csv pq.vecdb    --metric cosine --pq-m 16 --ksub 256  # Pro
 $V build-opq    vecs.csv opq.vecdb   --metric cosine --pq-m 16 --opq-iters 4  # 回転付きPQ
 $V build-ivfpq  vecs.csv ivfpq.vecdb --metric cosine --nlist 256 --pq-m 16    # IVF+PQ
 $V build-diskann vecs.csv da.vecdb   --metric cosine -r 32 --alpha 1.2        # DiskANN/Vamana
+$V build-diskann vecs.csv da.vecdb   --streaming --sample 50000               # 省メモリ構築（生を非常駐）
 $V info   hnsw.vecdb
 $V search flat.vecdb  query.csv -k 10 --oversample 4
 $V search ivf.vecdb   query.csv -k 10 --nprobe 16
@@ -276,11 +277,30 @@ let disk = DiskAnnIndex::open("index.diskann.vecdb")?;   // -> MmapDiskAnn
 let hits = disk.search(&query, 10, 64);
 ```
 
-構築は in-memory、探索は **`open()` で mmap 常駐**（グラフ＋生ベクトルはマップから読み、PQ だけ RAM）。
+探索は **`open()` で mmap 常駐**（グラフ＋生ベクトルはマップから読み、PQ だけ RAM）。
 これで DiskANN 本来の「SSD にグラフ＋生・RAM に圧縮コード」構成になる（RAM フットプリントは
 次元非依存の `count*m` バイト）。SIFT10K では L=64 で recall 0.999（in-memory 10k では HNSW が
 速い＝DiskANN の真価は RAM に載らない大規模を SSD で捌く領域、という素直な結果）。CLI の
 `search` も DiskANN は自動で mmap 経路を使う。
+
+**省メモリ / ストリーミング構築（`build_streaming`）**: 生ベクトルを RAM に全部載せずに `.vecdb` を
+直接生成する。処理済みベクトルを一時ファイルへ逐次書き出し（Pass1）→ 有限サンプルで PQ 学習 →
+逐次読み直して符号化＋medoid 決定（Pass2, 常駐は1本ずつ）→ グラフ構築は **SDC（対称距離計算＝
+PQ セントロイド対の距離表）** で生ベクトル不要 → 生 f32 セクションは一時ファイルから**ストリーム
+コピー**。ピーク常駐は `O(count*m + m*ksub² + edges)` で**次元非依存**。
+
+```rust
+// 生ベクトルを一度も全常駐させずに .vecdb を構築（items は所有イテレータ＝実ストリーム源でも可）
+DiskAnnIndex::build_streaming(
+    "index.diskann.vecdb", dim, Metric::L2,
+    /*R=*/32, /*l_build=*/96, /*alpha=*/1.2, /*pq_m=*/16, /*ksub=*/256,
+    /*sample=*/50_000, items.into_iter(),
+)?;
+let disk = DiskAnnIndex::open("index.diskann.vecdb")?;
+```
+
+グラフ幾何は PQ 近似（厳密 L2 の `build` より低品質）だが、探索時のビーム rerank は厳密 f32 なので
+実効 recall は高い（SIFT 相当の合成データで recall ≥ 0.90）。CLI: `build-diskann --streaming [--sample N]`。
 
 **逐次更新（FreshDiskANN 相当）**: 全再構築なしの `insert` / `remove` / `consolidate`。
 

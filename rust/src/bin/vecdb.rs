@@ -12,7 +12,7 @@
 //!   vecdb build-pq     <in.csv> <out.vecdb> [--metric m] [--pq-m M] [--ksub K] [--iters N] [--compact]
 //!   vecdb build-ivfpq  <in.csv> <out.vecdb> [--metric m] [--nlist N] [--pq-m M] [--ksub K] [--iters N] [--compact]
 //!   vecdb build-opq    <in.csv> <out.vecdb> [--metric m] [--pq-m M] [--ksub K] [--iters N] [--opq-iters N] [--compact]
-//!   vecdb build-diskann <in.csv> <out.vecdb> [--metric m] [-r R] [--l-build N] [--alpha A] [--pq-m M] [--ksub K]
+//!   vecdb build-diskann <in.csv> <out.vecdb> [--metric m] [-r R] [--l-build N] [--alpha A] [--pq-m M] [--ksub K] [--streaming [--sample N]]
 //!   vecdb search       <index.vecdb> <query.csv> [-k N] [--oversample M]
 //!                      [--nprobe N] [--ef N]   (index type auto-detected)
 //!   vecdb info         <index.vecdb>
@@ -120,6 +120,10 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
+}
+
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
 }
 
 fn parse_flag<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> Result<T, String> {
@@ -296,6 +300,29 @@ fn cmd_build_diskann(args: &[String]) -> Result<(), String> {
     let ksub: usize = parse_flag(args, "--ksub", 256)?;
     if !dim.is_multiple_of(pq_m) {
         return Err(format!("--pq-m {pq_m} must divide dim {dim}"));
+    }
+    if has_flag(args, "--streaming") {
+        // Low-memory build: never holds all raw vectors resident. `--sample`
+        // bounds the PQ-training set.
+        let sample: usize = parse_flag(args, "--sample", 50_000)?;
+        let n = records.len();
+        DiskAnnIndex::build_streaming(
+            &output,
+            dim,
+            metric,
+            r,
+            l_build,
+            alpha,
+            pq_m,
+            ksub,
+            sample,
+            records.into_iter(),
+        )
+        .map_err(|e| e.to_string())?;
+        println!(
+            "built diskann (streaming): {n} vectors (dim {dim}, {metric:?}, R {r}, sample {sample}) -> {output}"
+        );
+        return Ok(());
     }
     let idx = DiskAnnIndex::build(&records, metric, r, l_build, alpha, pq_m, ksub);
     idx.save(&output).map_err(|e| e.to_string())?;

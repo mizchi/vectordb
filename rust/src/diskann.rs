@@ -23,7 +23,7 @@ use crate::distance::{dot_f32, l2sq_f32};
 use crate::index::{Hit, Metric};
 use crate::pq::{adc_sum, build_lut, encode_vector, train_codebooks};
 use std::collections::HashSet;
-use std::io;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 /// A minimal DiskANN / Vamana index.
@@ -118,10 +118,11 @@ fn greedy_search<F: Fn(u32) -> f32>(
 }
 
 /// RobustPrune: from the candidate pool (visited ∪ existing neighbors), keep up
-/// to `r` diverse out-edges for `p`. Distances are squared-L2 in processed space.
-fn robust_prune(
-    vectors: &[f32],
-    dim: usize,
+/// to `r` diverse out-edges for `p`, using the node-to-node distance `dist`
+/// (exact squared-L2 for the in-memory build; PQ symmetric distance for the
+/// low-memory build).
+fn robust_prune<D: Fn(u32, u32) -> f32>(
+    dist: &D,
     p: u32,
     pool: &[u32],
     alpha: f32,
@@ -131,7 +132,7 @@ fn robust_prune(
     let mut cand: Vec<(f32, u32)> = Vec::new();
     for &c in pool {
         if c != p && seen.insert(c) {
-            cand.push((l2_ab(vectors, dim, p, c), c));
+            cand.push((dist(p, c), c));
         }
     }
     cand.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -153,13 +154,64 @@ fn robust_prune(
             }
             let cj = cand[j].1;
             let d_p_cj = cand[j].0;
-            let d_c_cj = l2_ab(vectors, dim, c, cj);
+            let d_c_cj = dist(c, cj);
             if alpha * d_c_cj <= d_p_cj {
                 removed[j] = true;
             }
         }
     }
     result
+}
+
+/// Build a Vamana graph over `n` nodes from `entry`, using the node-to-node
+/// distance `dist`. Random R-regular init for connectivity, then the insertion
+/// pass (greedy-search → RobustPrune → back-edges) in a shuffled order.
+fn vamana_build<D: Fn(u32, u32) -> f32>(
+    n: usize,
+    entry: u32,
+    r: usize,
+    l_build: usize,
+    alpha: f32,
+    dist: &D,
+) -> Vec<Vec<u32>> {
+    let mut graph: Vec<Vec<u32>> = vec![Vec::new(); n];
+    if n <= 1 {
+        return graph;
+    }
+    let mut rng = Rng(0x1234_5678_9ABC_DEF1 ^ n as u64);
+    for (i, nbrs) in graph.iter_mut().enumerate() {
+        let deg = r.min(n - 1);
+        let mut seen = HashSet::new();
+        while nbrs.len() < deg {
+            let c = (rng.next() % n as u64) as u32;
+            if c as usize != i && seen.insert(c) {
+                nbrs.push(c);
+            }
+        }
+    }
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    let mut rng = Rng(0xF00D_BABE_1234_5678 ^ n as u64);
+    for i in (1..order.len()).rev() {
+        let j = (rng.next() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    for &p in &order {
+        let (mut pool, _) = greedy_search(&graph, entry, l_build, |node| dist(node, p));
+        pool.extend_from_slice(&graph[p as usize]);
+        graph[p as usize] = robust_prune(dist, p, &pool, alpha, r);
+        let nbrs = graph[p as usize].clone();
+        for j in nbrs {
+            let jn = j as usize;
+            if !graph[jn].contains(&p) {
+                graph[jn].push(p);
+                if graph[jn].len() > r {
+                    let pool2 = graph[jn].clone();
+                    graph[jn] = robust_prune(dist, j, &pool2, alpha, r);
+                }
+            }
+        }
+    }
+    graph
 }
 
 impl DiskAnnIndex {
@@ -233,49 +285,8 @@ impl DiskAnnIndex {
             );
         }
 
-        // Random R-regular init graph so greedy is connected from the start.
-        let mut graph: Vec<Vec<u32>> = vec![Vec::new(); n];
-        if n > 1 {
-            let mut rng = Rng(0x1234_5678_9ABC_DEF1 ^ n as u64);
-            for (i, nbrs) in graph.iter_mut().enumerate() {
-                let deg = r.min(n - 1);
-                let mut seen = HashSet::new();
-                while nbrs.len() < deg {
-                    let c = (rng.next() % n as u64) as u32;
-                    if c as usize != i && seen.insert(c) {
-                        nbrs.push(c);
-                    }
-                }
-            }
-        }
-
-        // Vamana insertion pass in a random order.
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        let mut rng = Rng(0xF00D_BABE_1234_5678 ^ n as u64);
-        for i in (1..order.len()).rev() {
-            let j = (rng.next() % (i as u64 + 1)) as usize;
-            order.swap(i, j);
-        }
-        for &p in &order {
-            let (visited, _) =
-                greedy_search(&graph, entry, l_build, |node| l2_ab(&vecs, dim, node, p));
-            let mut pool = visited;
-            pool.extend_from_slice(&graph[p as usize]);
-            graph[p as usize] = robust_prune(&vecs, dim, p, &pool, alpha, r);
-            // Add back-edges; re-prune neighbors that overflow.
-            let nbrs = graph[p as usize].clone();
-            for j in nbrs {
-                let jn = j as usize;
-                if !graph[jn].contains(&p) {
-                    graph[jn].push(p);
-                    if graph[jn].len() > r {
-                        let mut pool2 = graph[jn].clone();
-                        pool2.push(p);
-                        graph[jn] = robust_prune(&vecs, dim, j, &pool2, alpha, r);
-                    }
-                }
-            }
-        }
+        // Vamana graph, exact squared-L2 over the (resident) processed vectors.
+        let graph = vamana_build(n, entry, r, l_build, alpha, &|a, b| l2_ab(&vecs, dim, a, b));
 
         DiskAnnIndex {
             dim,
@@ -296,6 +307,226 @@ impl DiskAnnIndex {
             codebooks,
             codes,
         }
+    }
+
+    /// Build a DiskANN `.vecdb` file **without ever holding all raw vectors in
+    /// RAM** — the low-memory / streaming construction path.
+    ///
+    /// Peak resident memory is `O(n·m + m·ksub² + edges)` (PQ codes + the SDC
+    /// centroid-pair table + the graph), independent of the vector dimension:
+    /// the `n·dim·4` raw floats never all live in memory at once.
+    ///
+    /// - **Pass 1** streams every (normalized) vector straight to a temp file,
+    ///   accumulating only the running mean, the id list, and a bounded PQ
+    ///   training sample (`sample_size` vectors).
+    /// - PQ codebooks are trained on that sample.
+    /// - **Pass 2** re-reads the temp file sequentially, PQ-encoding each vector
+    ///   and picking the medoid (nearest to the mean) — one vector resident at a
+    ///   time.
+    /// - The Vamana graph is built with **symmetric distance computation (SDC)**:
+    ///   node-to-node distances come from a precomputed per-subspace
+    ///   centroid-distance table over the PQ codes, so the raw vectors are not
+    ///   needed during graph construction.
+    /// - Finally the header/graph/ids/codebooks/codes are written and the raw f32
+    ///   section is **stream-copied** from the temp file into the output.
+    ///
+    /// The graph geometry is PQ-approximate (lower quality than [`build`], which
+    /// uses exact L2), but search still reranks the beam with exact f32 read from
+    /// the map, so end recall stays high. [`open`] reads the result as usual.
+    ///
+    /// [`build`]: Self::build
+    /// [`open`]: Self::open
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_streaming<I: IntoIterator<Item = (u64, Vec<f32>)>>(
+        path: impl AsRef<Path>,
+        dim: usize,
+        metric: Metric,
+        r: usize,
+        l_build: usize,
+        alpha: f32,
+        m: usize,
+        ksub: usize,
+        sample_size: usize,
+        items: I,
+    ) -> io::Result<()> {
+        assert!(
+            dim > 0 && m > 0 && dim.is_multiple_of(m),
+            "m must divide dim"
+        );
+        assert!(ksub > 0 && ksub <= 256, "ksub must be in 1..=256");
+        assert!(r >= 1 && alpha >= 1.0);
+        assert!(sample_size >= 1, "sample_size must be >= 1");
+        let dsub = dim / m;
+        let cosine = metric == Metric::Cosine;
+
+        let path = path.as_ref();
+        let tmp = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".rawtmp");
+            std::path::PathBuf::from(s)
+        };
+
+        // Pass 1: stream processed vectors to the temp file; collect ids, the
+        // running mean, and a bounded PQ-training sample.
+        let mut ids: Vec<u64> = Vec::new();
+        let mut mean = vec![0f64; dim];
+        let mut sample: Vec<f32> = Vec::new();
+        let mut sample_count = 0usize;
+        let mut n = 0usize;
+        {
+            let f = std::fs::File::create(&tmp)?;
+            let mut w = BufWriter::new(f);
+            for (id, v) in items {
+                assert_eq!(v.len(), dim, "inconsistent dimension");
+                let p = if cosine { normalize(&v) } else { v };
+                for (d, &x) in p.iter().enumerate() {
+                    mean[d] += x as f64;
+                    w.write_all(&x.to_le_bytes())?;
+                }
+                if sample_count < sample_size {
+                    sample.extend_from_slice(&p);
+                    sample_count += 1;
+                }
+                ids.push(id);
+                n += 1;
+            }
+            w.flush()?;
+        }
+        if n == 0 {
+            std::fs::remove_file(&tmp).ok();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "diskann: build_streaming got empty input",
+            ));
+        }
+        for d in mean.iter_mut() {
+            *d /= n as f64;
+        }
+        let mean: Vec<f32> = mean.iter().map(|&x| x as f32).collect();
+        let ksub = ksub.min(sample_count);
+
+        // PQ codebooks from the sample.
+        let codebooks = train_codebooks(&sample, sample_count, dim, m, ksub, 15);
+        drop(sample);
+
+        // Pass 2: re-read the temp file sequentially, encoding each vector and
+        // tracking the medoid — one vector resident at a time.
+        let mut codes = vec![0u8; n * m];
+        let mut entry = 0u32;
+        let mut best = f32::INFINITY;
+        {
+            let f = std::fs::File::open(&tmp)?;
+            let mut rdr = BufReader::new(f);
+            let mut buf = vec![0u8; dim * 4];
+            let mut vbuf = vec![0f32; dim];
+            for i in 0..n {
+                rdr.read_exact(&mut buf)?;
+                for (d, slot) in vbuf.iter_mut().enumerate() {
+                    let o = d * 4;
+                    *slot = f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+                }
+                encode_vector(
+                    &codebooks,
+                    dim,
+                    m,
+                    ksub,
+                    &vbuf,
+                    &mut codes[i * m..(i + 1) * m],
+                );
+                let dd = l2sq_f32(&vbuf, &mean);
+                if dd < best {
+                    best = dd;
+                    entry = i as u32;
+                }
+            }
+        }
+
+        // SDC table: dtab[j*ksub*ksub + a*ksub + b] = ||centroid[j][a] - centroid[j][b]||².
+        let mut dtab = vec![0f32; m * ksub * ksub];
+        for j in 0..m {
+            for a in 0..ksub {
+                let ca = &codebooks[(j * ksub + a) * dsub..(j * ksub + a) * dsub + dsub];
+                for b in 0..ksub {
+                    let cb = &codebooks[(j * ksub + b) * dsub..(j * ksub + b) * dsub + dsub];
+                    dtab[j * ksub * ksub + a * ksub + b] = l2sq_f32(ca, cb);
+                }
+            }
+        }
+
+        // Vamana graph over the PQ codes via symmetric distance computation.
+        let sdc = |a: u32, b: u32| {
+            let ca = &codes[a as usize * m..a as usize * m + m];
+            let cb = &codes[b as usize * m..b as usize * m + m];
+            let mut s = 0f32;
+            for j in 0..m {
+                s += dtab[j * ksub * ksub + ca[j] as usize * ksub + cb[j] as usize];
+            }
+            s
+        };
+        let graph = vamana_build(n, entry, r, l_build, alpha, &sdc);
+
+        // Layout (mirrors `save`/`layout`; the raw section is filled by
+        // stream-copy rather than being materialized in the head buffer).
+        let goff = align16(64);
+        let gnbr = align16(goff + (n + 1) * 8);
+        let edges: usize = graph.iter().map(|g| g.len()).sum();
+        let ids_off = align16(gnbr + edges * 4);
+        let cb_off = align16(ids_off + n * 8);
+        let codes_off = align16(cb_off + m * ksub * dsub * 4);
+        let raw_off = align16(codes_off + n * m);
+        let total = align16(raw_off + n * dim * 4);
+
+        // Head buffer: everything up to (but not including) the raw section.
+        let mut b = vec![0u8; raw_off];
+        b[0..8].copy_from_slice(DA_MAGIC);
+        b[8..12].copy_from_slice(&DA_VERSION.to_le_bytes());
+        b[12..16].copy_from_slice(&(metric as u32).to_le_bytes());
+        b[16..20].copy_from_slice(&(dim as u32).to_le_bytes());
+        b[20..24].copy_from_slice(&(n as u32).to_le_bytes());
+        b[24..28].copy_from_slice(&(r as u32).to_le_bytes());
+        b[28..32].copy_from_slice(&entry.to_le_bytes());
+        b[32..36].copy_from_slice(&(m as u32).to_le_bytes());
+        b[36..40].copy_from_slice(&(ksub as u32).to_le_bytes());
+        b[40..44].copy_from_slice(&(l_build as u32).to_le_bytes());
+        b[44..48].copy_from_slice(&alpha.to_le_bytes());
+
+        // CSR graph (offset row then its neighbors), matching `save`.
+        let mut cursor = gnbr;
+        let mut acc = 0u64;
+        for (i, row) in graph.iter().enumerate() {
+            let o = goff + i * 8;
+            b[o..o + 8].copy_from_slice(&acc.to_le_bytes());
+            for &nb in row {
+                b[cursor..cursor + 4].copy_from_slice(&nb.to_le_bytes());
+                cursor += 4;
+            }
+            acc += row.len() as u64;
+        }
+        b[goff + n * 8..goff + n * 8 + 8].copy_from_slice(&acc.to_le_bytes());
+
+        for (i, &id) in ids.iter().enumerate() {
+            b[ids_off + i * 8..ids_off + i * 8 + 8].copy_from_slice(&id.to_le_bytes());
+        }
+        put_f32s(&mut b, cb_off, &codebooks);
+        b[codes_off..codes_off + codes.len()].copy_from_slice(&codes);
+
+        // Write head, then stream-copy the raw f32 section from the temp file,
+        // then zero-pad the alignment tail.
+        {
+            let out = std::fs::File::create(path)?;
+            let mut w = BufWriter::new(out);
+            w.write_all(&b)?;
+            let f = std::fs::File::open(&tmp)?;
+            let mut rdr = BufReader::new(f);
+            io::copy(&mut rdr, &mut w)?;
+            let written = raw_off + n * dim * 4;
+            if total > written {
+                w.write_all(&vec![0u8; total - written])?;
+            }
+            w.flush()?;
+        }
+        std::fs::remove_file(&tmp).ok();
+        Ok(())
     }
 
     pub fn dim(&self) -> usize {
@@ -360,8 +591,8 @@ impl DiskAnnIndex {
         let (visited, _) = greedy_search(&self.graph, self.entry, self.l_build, |x| {
             l2_ab(&self.vectors, dim, x, node)
         });
-        self.graph[node as usize] =
-            robust_prune(&self.vectors, dim, node, &visited, self.alpha, self.r);
+        let dprune = |a: u32, b: u32| l2_ab(&self.vectors, dim, a, b);
+        self.graph[node as usize] = robust_prune(&dprune, node, &visited, self.alpha, self.r);
         let nbrs = self.graph[node as usize].clone();
         for j in nbrs {
             let jn = j as usize;
@@ -369,7 +600,7 @@ impl DiskAnnIndex {
                 self.graph[jn].push(node);
                 if self.graph[jn].len() > self.r {
                     let pool = self.graph[jn].clone();
-                    self.graph[jn] = robust_prune(&self.vectors, dim, j, &pool, self.alpha, self.r);
+                    self.graph[jn] = robust_prune(&dprune, j, &pool, self.alpha, self.r);
                 }
             }
         }
@@ -1023,6 +1254,89 @@ mod tests {
             let q = &items[t * 11 % n].1;
             assert!(idx.search(q, 10, 96).iter().all(|h| h.id % 5 != 0));
         }
+    }
+
+    #[test]
+    fn diskann_streaming_build_high_recall() {
+        let dim = 64;
+        let items = clustered(3000, dim, 25);
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_diskann_streaming.vecdb");
+        // Low-memory build: raw vectors are never all resident. Feed them as an
+        // owned iterator (as a real streaming source would).
+        DiskAnnIndex::build_streaming(
+            &path,
+            dim,
+            Metric::L2,
+            32,
+            96,
+            1.2,
+            16,
+            256,
+            1000, // PQ training sample
+            items.iter().cloned(),
+        )
+        .unwrap();
+        let idx = DiskAnnIndex::open(&path).unwrap();
+        assert_eq!(idx.len(), items.len());
+
+        let mut flat = crate::FlatIndex::new(dim, Metric::L2, true);
+        for (id, v) in &items {
+            flat.add(*id, v);
+        }
+        let mut hit = 0;
+        let mut total = 0;
+        for t in 0..40 {
+            let q = &items[t * 17 % items.len()].1;
+            let truth: std::collections::HashSet<u64> =
+                flat.search_exact(q, 10).iter().map(|h| h.id).collect();
+            hit += idx
+                .search(q, 10, 128)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
+            total += truth.len();
+        }
+        let recall = hit as f64 / total as f64;
+        // SDC-built graph is lower quality than the exact-L2 build, but the exact
+        // f32 rerank of the beam recovers most of the loss.
+        assert!(recall >= 0.90, "streaming DiskANN recall too low: {recall}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn diskann_streaming_cosine_finds_self() {
+        let dim = 48;
+        let items = clustered(1500, dim, 30);
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_diskann_streaming_cos.vecdb");
+        DiskAnnIndex::build_streaming(
+            &path,
+            dim,
+            Metric::Cosine,
+            32,
+            96,
+            1.2,
+            12,
+            256,
+            800,
+            items.iter().cloned(),
+        )
+        .unwrap();
+        let idx = DiskAnnIndex::open(&path).unwrap();
+        let mut found = 0;
+        for t in 0..20 {
+            let (id, v) = &items[t * 13 % items.len()];
+            if idx.search(v, 1, 96)[0].id == *id {
+                found += 1;
+            }
+        }
+        // Self-retrieval should be near-perfect even with PQ-approximate build.
+        assert!(
+            found >= 19,
+            "streaming cosine self-recall too low: {found}/20"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

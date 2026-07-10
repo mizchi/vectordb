@@ -147,6 +147,14 @@ query(f32)
   生 f32 で rerank（`VECDBDA1`）。`open()` で **mmap 常駐探索**（グラフ＋生はマップ上、
   RAM は PQ コードのみ = 次元非依存の `count*m` バイト）。**逐次更新**（FreshDiskANN 相当）:
   `insert`（グラフへ Vamana 挿入）/ `remove`（tombstone）/ `consolidate`（生存集合で再構築）。
+- **省メモリ / ストリーミング構築**（`build_streaming`）: 生ベクトルを RAM に全部載せずに
+  `.vecdb` を直接生成する。**Pass1** で処理済みベクトルを一時ファイルへ逐次書き出し（平均・id・
+  PQ 学習用の有限サンプルのみ蓄積）→ サンプルで PQ 学習 → **Pass2** で一時ファイルを逐次読み直して
+  PQ 符号化＋medoid 決定（常駐は1本ずつ）→ グラフ構築は **SDC（対称距離計算: PQ セントロイド対の
+  距離表）** で行い生ベクトル不要 → 最後にヘッダ/グラフ/コードを書き、生 f32 セクションは一時ファイルから
+  **ストリームコピー**。ピーク常駐は `O(count*m + m*ksub² + edges)` で**次元非依存**。グラフ幾何は
+  PQ 近似（`build` の厳密 L2 より低品質）だが、探索時のビーム rerank は厳密 f32 なので実効 recall は高い
+  （SIFT 相当の合成データで recall ≥ 0.90）。CLI: `build-diskann --streaming [--sample N]`。
 
 ### 量子化（Rust）
 - int8 スカラ / **binary(1-bit, Hamming)** / **RaBitQ(回転+符号+不偏推定)** /
@@ -184,5 +192,5 @@ query(f32)
 
 - MoonBit への 並列 / mmap 相当の移植（インデックス・量子化はほぼ全て移植済み）。
 - フィルタ選択率に応じた探索の適応化、GPU/バッチ ADC の SIMD 最適化。
-- DiskANN の構築自体のディスク/ストリーミング化（探索は mmap 常駐、逐次 insert/remove/consolidate は実装済み; 構築の初期パスは in-memory）。
+- DiskANN 構築の並列グラフ化（`build_streaming` で生ベクトルの非常駐化＝省メモリ構築は実装済み。SDC グラフ構築は現状シングルスレッド）。
 - IVF の削除後リバランス、HNSW の逐次削除（現状 compact は再構築）。
