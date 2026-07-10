@@ -277,6 +277,15 @@ let hits = disk.search(&query, 10, 64);
 速い＝DiskANN の真価は RAM に載らない大規模を SSD で捌く領域、という素直な結果）。CLI の
 `search` も DiskANN は自動で mmap 経路を使う。
 
+**逐次更新（FreshDiskANN 相当）**: 全再構築なしの `insert` / `remove` / `consolidate`。
+
+```rust
+idx.insert(id, &vector);   // 既存グラフへ Vamana 挿入（O(l_build·R)、PQは再学習しない）
+idx.remove(id);            // tombstone（検索から除外、グラフは通過して連結性維持）
+idx.live_len();            // 生存件数
+idx.consolidate();         // 削除点を物理削除して生存集合で再構築
+```
+
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
 - `quantize.rs` — int8 スカラ量子化

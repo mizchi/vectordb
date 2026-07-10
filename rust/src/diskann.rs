@@ -32,10 +32,14 @@ pub struct DiskAnnIndex {
     metric: Metric,
     count: usize,
     r: usize,          // max out-degree
+    l_build: usize,    // build/insert beam width
+    alpha: f32,        // RobustPrune slack
     entry: u32,        // medoid
     vectors: Vec<f32>, // count * dim, processed ("disk" tier)
     ids: Vec<u64>,
     graph: Vec<Vec<u32>>, // adjacency, degree <= r
+    deleted: Vec<bool>,   // per-row tombstones (in-memory)
+    deleted_count: usize,
     // PQ, RAM-resident, always L2 for traversal.
     m: usize,
     dsub: usize,
@@ -278,10 +282,14 @@ impl DiskAnnIndex {
             metric,
             count: n,
             r,
+            l_build,
+            alpha,
             entry,
             vectors: vecs,
             ids,
             graph,
+            deleted: vec![false; n],
+            deleted_count: 0,
             m,
             dsub,
             ksub,
@@ -308,6 +316,101 @@ impl DiskAnnIndex {
             return 0.0;
         }
         self.graph.iter().map(|g| g.len()).sum::<usize>() as f32 / self.count as f32
+    }
+
+    /// Number of live (non-tombstoned) vectors.
+    pub fn live_len(&self) -> usize {
+        self.count - self.deleted_count
+    }
+
+    /// Incrementally insert one vector (FreshDiskANN-style): append the point,
+    /// PQ-encode it against the existing codebooks (no retrain), greedily search
+    /// the current graph for its neighborhood, `RobustPrune` to its out-edges,
+    /// and add pruned back-edges. O(l_build · R) — no full rebuild.
+    pub fn insert(&mut self, id: u64, vector: &[f32]) {
+        assert_eq!(vector.len(), self.dim, "dimension mismatch");
+        let dim = self.dim;
+        let processed = if self.metric == Metric::Cosine {
+            normalize(vector)
+        } else {
+            vector.to_vec()
+        };
+        let node = self.count as u32;
+        self.vectors.extend_from_slice(&processed);
+        self.ids.push(id);
+        self.deleted.push(false);
+        self.graph.push(Vec::new());
+        let mut code = vec![0u8; self.m];
+        encode_vector(
+            &self.codebooks,
+            dim,
+            self.m,
+            self.ksub,
+            &processed,
+            &mut code,
+        );
+        self.codes.extend_from_slice(&code);
+        self.count += 1;
+        if self.count == 1 {
+            self.entry = 0;
+            return;
+        }
+        // Greedy search from the entry to the new point (exact L2), prune to
+        // out-edges, and wire back-edges.
+        let (visited, _) = greedy_search(&self.graph, self.entry, self.l_build, |x| {
+            l2_ab(&self.vectors, dim, x, node)
+        });
+        self.graph[node as usize] =
+            robust_prune(&self.vectors, dim, node, &visited, self.alpha, self.r);
+        let nbrs = self.graph[node as usize].clone();
+        for j in nbrs {
+            let jn = j as usize;
+            if !self.graph[jn].contains(&node) {
+                self.graph[jn].push(node);
+                if self.graph[jn].len() > self.r {
+                    let pool = self.graph[jn].clone();
+                    self.graph[jn] = robust_prune(&self.vectors, dim, j, &pool, self.alpha, self.r);
+                }
+            }
+        }
+    }
+
+    /// Tombstone every row with external id `id` (excluded from results; the
+    /// graph is still traversed through it). Returns how many were newly
+    /// deleted. Call [`consolidate`](Self::consolidate) to physically remove
+    /// them (and before `save`, since the format stores only live rows).
+    pub fn remove(&mut self, id: u64) -> usize {
+        let mut removed = 0;
+        for i in 0..self.count {
+            if self.ids[i] == id && !self.deleted[i] {
+                self.deleted[i] = true;
+                self.deleted_count += 1;
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Physically drop tombstoned points by rebuilding the graph over the live
+    /// set (fresh Vamana). Codebooks are retrained on the survivors.
+    pub fn consolidate(&mut self) {
+        if self.deleted_count == 0 {
+            return;
+        }
+        let dim = self.dim;
+        let live: Vec<(u64, Vec<f32>)> = (0..self.count)
+            .filter(|&i| !self.deleted[i])
+            .map(|i| (self.ids[i], self.vectors[i * dim..(i + 1) * dim].to_vec()))
+            .collect();
+        *self = DiskAnnIndex::build(
+            &live,
+            self.metric,
+            self.r,
+            self.l_build,
+            self.alpha,
+            self.m,
+            self.ksub,
+        );
     }
 
     fn process(&self, query: &[f32]) -> Vec<f32> {
@@ -349,6 +452,7 @@ impl DiskAnnIndex {
         let hib = self.metric.higher_is_better();
         let mut scored: Vec<(f32, u32)> = beam
             .iter()
+            .filter(|&&(_, node)| !self.deleted[node as usize])
             .map(|&(_, node)| {
                 let v = &self.vectors[node as usize * self.dim..(node as usize + 1) * self.dim];
                 let key = match self.metric {
@@ -434,6 +538,8 @@ impl DiskAnnIndex {
         b[28..32].copy_from_slice(&self.entry.to_le_bytes());
         b[32..36].copy_from_slice(&(self.m as u32).to_le_bytes());
         b[36..40].copy_from_slice(&(self.ksub as u32).to_le_bytes());
+        b[40..44].copy_from_slice(&(self.l_build as u32).to_le_bytes());
+        b[44..48].copy_from_slice(&self.alpha.to_le_bytes());
 
         // CSR graph.
         let mut cursor = l.gnbr;
@@ -481,6 +587,8 @@ impl DiskAnnIndex {
         let entry = u32_at(28);
         let m = u32_at(32) as usize;
         let ksub = u32_at(36) as usize;
+        let l_build = u32_at(40) as usize;
+        let alpha = f32::from_le_bytes([b[44], b[45], b[46], b[47]]);
         if dim == 0 || m == 0 || !dim.is_multiple_of(m) {
             return Err(bad("bad dim/m"));
         }
@@ -496,10 +604,14 @@ impl DiskAnnIndex {
             metric,
             count,
             r,
+            l_build,
+            alpha,
             entry,
             vectors: Vec::new(),
             ids: Vec::new(),
             graph: Vec::new(),
+            deleted: vec![false; count],
+            deleted_count: 0,
             m,
             dsub,
             ksub,
@@ -825,6 +937,68 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn diskann_incremental_insert_matches_search() {
+        let dim = 48;
+        let items = clustered(1500, dim, 20);
+        // Build from the first 1000, then stream in the remaining 500.
+        let idx_full = DiskAnnIndex::build(&items, Metric::L2, 32, 96, 1.2, 12, 128);
+        let mut idx = DiskAnnIndex::build(&items[..1000], Metric::L2, 32, 96, 1.2, 12, 128);
+        for (id, v) in &items[1000..] {
+            idx.insert(*id, v);
+        }
+        assert_eq!(idx.len(), items.len());
+        // Recall of the incrementally-grown index vs exact.
+        let mut flat = crate::FlatIndex::new(dim, Metric::L2, true);
+        for (id, v) in &items {
+            flat.add(*id, v);
+        }
+        let mut hit = 0;
+        let mut total = 0;
+        for t in 0..40 {
+            let q = &items[t * 17 % items.len()].1;
+            let truth: std::collections::HashSet<u64> =
+                flat.search_exact(q, 10).iter().map(|h| h.id).collect();
+            hit += idx
+                .search(q, 10, 96)
+                .iter()
+                .filter(|h| truth.contains(&h.id))
+                .count();
+            total += truth.len();
+        }
+        assert!(hit as f64 / total as f64 >= 0.90, "insert recall too low");
+        // Sanity: the fully-built index has the same node count.
+        assert_eq!(idx_full.len(), idx.len());
+    }
+
+    #[test]
+    fn diskann_remove_and_consolidate() {
+        let dim = 48;
+        let items = clustered(1500, dim, 20);
+        let mut idx = DiskAnnIndex::build(&items, Metric::L2, 32, 96, 1.2, 12, 128);
+        let n = items.len();
+        // Tombstone all ids divisible by 5; they must never appear.
+        let mut removed = 0;
+        for (id, _) in &items {
+            if id % 5 == 0 {
+                removed += idx.remove(*id);
+            }
+        }
+        assert_eq!(idx.live_len(), n - removed);
+        for t in 0..30 {
+            let q = &items[t * 13 % n].1;
+            assert!(idx.search(q, 10, 96).iter().all(|h| h.id % 5 != 0));
+        }
+        // Consolidation physically drops them; results still respect it.
+        idx.consolidate();
+        assert_eq!(idx.len(), n - removed);
+        assert_eq!(idx.live_len(), n - removed);
+        for t in 0..30 {
+            let q = &items[t * 11 % n].1;
+            assert!(idx.search(q, 10, 96).iter().all(|h| h.id % 5 != 0));
+        }
     }
 
     #[test]
