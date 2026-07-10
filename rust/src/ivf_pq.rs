@@ -458,6 +458,24 @@ fn read_f32s(b: &[u8], off: usize, n: usize) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(feature = "parallel")]
+impl IvfPqIndex {
+    /// Run many queries concurrently (one query per rayon task).
+    pub fn search_batch(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        nprobe: usize,
+        oversample: usize,
+    ) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, nprobe, oversample))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

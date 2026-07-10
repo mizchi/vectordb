@@ -627,6 +627,36 @@ impl Rng {
     }
 }
 
+#[cfg(feature = "parallel")]
+impl RabitqIndex {
+    /// Run many queries concurrently (one query per rayon task).
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, oversample: usize) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, oversample))
+            .collect()
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl IvfRabitqIndex {
+    /// Run many queries concurrently (one query per rayon task).
+    pub fn search_batch(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        nprobe: usize,
+        oversample: usize,
+    ) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, nprobe, oversample))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

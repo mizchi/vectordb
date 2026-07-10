@@ -81,6 +81,11 @@ recall@10 ≒ 1.0、メモリは int8 コード 6MiB（f32 なら 24MiB）。
 バックする（小規模では fork/join オーバーヘッドが上回るため）。スレッド並列が不要なら
 `--no-default-features` で `rayon` 依存ごと外せる（`search`/`search_exact` はそのまま利用可）。
 
+`search_batch`（クエリ間並列）は**全インデックスに実装**（Flat / IVF / HNSW / int8-HNSW /
+PQ / IVF+PQ / OPQ / RaBitQ / IVF+RaBitQ / binary / DiskANN）。各 index の `search` と同じ
+引数列に `queries: &[Vec<f32>]` を渡す形（例: `pq.search_batch(&qs, 10, 8)`,
+`ivfpq.search_batch(&qs, 10, 16, 16)`, `diskann.search_batch(&qs, 10, 64)`）。
+
 ### IVF（転置インデックス, `ivf.rs`）
 
 大規模向けに、k-means でベクトルを `nlist` セルに分割し、検索時はクエリに近い

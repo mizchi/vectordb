@@ -643,6 +643,18 @@ impl HnswQIndex {
     }
 }
 
+#[cfg(feature = "parallel")]
+impl HnswQIndex {
+    /// Run many queries concurrently (one query per rayon task).
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, ef_search: usize) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, ef_search))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -483,6 +483,18 @@ impl PqIndex {
     }
 }
 
+#[cfg(feature = "parallel")]
+impl PqIndex {
+    /// Run many queries concurrently (one query per rayon task).
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, oversample: usize) -> Vec<Vec<Hit>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map(|q| self.search(q, k, oversample))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +574,23 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn pq_search_batch_matches_serial() {
+        let dim = 32;
+        let items = clustered(800, dim, 10);
+        let pq = PqIndex::build(&items, Metric::L2, 8, 64, 12, true);
+        let qs: Vec<Vec<f32>> = (0..20)
+            .map(|t| items[t * 7 % items.len()].1.clone())
+            .collect();
+        let batch = pq.search_batch(&qs, 10, 8);
+        for (q, b) in qs.iter().zip(batch.iter()) {
+            let s: Vec<u64> = pq.search(q, 10, 8).iter().map(|h| h.id).collect();
+            let bb: Vec<u64> = b.iter().map(|h| h.id).collect();
+            assert_eq!(s, bb);
+        }
     }
 
     #[test]
