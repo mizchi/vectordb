@@ -300,7 +300,21 @@ let disk = DiskAnnIndex::open("index.diskann.vecdb")?;
 ```
 
 グラフ幾何は PQ 近似（厳密 L2 の `build` より低品質）だが、探索時のビーム rerank は厳密 f32 なので
-実効 recall は高い（SIFT 相当の合成データで recall ≥ 0.90）。CLI: `build-diskann --streaming [--sample N]`。
+実効 recall は高い。CLI: `build-diskann --streaming [--sample N]`（CSV を1行ずつ遅延読みするので
+CLI 経由でも生ベクトルは非常駐）。
+
+**ドッグフーディング**（`examples/dogfood_streaming.rs`, 実 SIFT10K を fvecs から遅延ストリーム）:
+
+```
+$ cargo run --release --example dogfood_streaming -- siftsmall
+streaming(SDC) + mmap  L=64  recall@10=0.9970   # 生ベクトル非常駐
+in-memory(exact-L2)    L=64  recall@10=0.9990   # 全 raw 常駐
+```
+
+SDC 構築は厳密 L2 構築と L=128 で完全一致・L=32 で約1%差に収まる。CLI のピーク RSS 比較
+（40k×256 合成データ, `--pq-m 32`）: in-memory **137 MiB** → streaming **26 MiB**（約 5.3x 削減）。
+省メモリの旨味は生行列 `n·dim·4` が SDC テーブル `m·ksub²`（n 非依存）を上回る大規模で顕著
+（SIFT10K/128d のような小規模では両者が拮抗する）。
 
 **逐次更新（FreshDiskANN 相当）**: 全再構築なしの `insert` / `remove` / `consolidate`。
 

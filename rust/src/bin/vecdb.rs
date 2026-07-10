@@ -17,7 +17,8 @@
 //!                      [--nprobe N] [--ef N]   (index type auto-detected)
 //!   vecdb info         <index.vecdb>
 
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::process::ExitCode;
 use vectordb::{
     save, DiskAnnIndex, FlatIndex, Hit, HnswIndex, HnswQIndex, IvfIndex, IvfPqIndex, Metric,
@@ -113,6 +114,75 @@ fn read_records(path: &str) -> Result<Vec<(u64, Vec<f32>)>, String> {
         out.push((id, vec));
     }
     Ok(out)
+}
+
+/// Dimension of the first data record, without reading the whole file — used by
+/// the streaming DiskANN build so it can size the index before consuming rows.
+fn peek_csv_dim(path: &str) -> Result<usize, String> {
+    let f = File::open(path).map_err(|e| e.to_string())?;
+    for line in BufReader::new(f).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let cols = t.split(',').count();
+        if cols < 2 {
+            return Err("first record has no vector".into());
+        }
+        return Ok(cols - 1);
+    }
+    Err("no records".into())
+}
+
+/// A lazy CSV record reader: yields `(id, Vec<f32>)` one line at a time so the
+/// caller never holds the whole file in memory. On a malformed line it prints
+/// the error and exits (an infallible iterator can't surface a `Result`).
+struct CsvStream {
+    lines: std::io::Lines<BufReader<File>>,
+    lineno: usize,
+}
+
+impl CsvStream {
+    fn open(path: &str) -> Result<Self, String> {
+        let f = File::open(path).map_err(|e| e.to_string())?;
+        Ok(Self {
+            lines: BufReader::new(f).lines(),
+            lineno: 0,
+        })
+    }
+}
+
+impl Iterator for CsvStream {
+    type Item = (u64, Vec<f32>);
+    fn next(&mut self) -> Option<(u64, Vec<f32>)> {
+        loop {
+            let line = self.lines.next()?;
+            self.lineno += 1;
+            let line = line.unwrap_or_else(|e| {
+                eprintln!("error: read failed: {e}");
+                std::process::exit(1);
+            });
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let mut it = t.split(',');
+            let fail = |what: &str, lineno: usize| -> ! {
+                eprintln!("error: line {lineno}: {what}");
+                std::process::exit(1);
+            };
+            let id = it
+                .next()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or_else(|| fail("bad id", self.lineno));
+            let v: Vec<f32> = it
+                .map(|f| f.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .unwrap_or_else(|_| fail("bad float", self.lineno));
+            return Some((id, v));
+        }
+    }
 }
 
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -291,23 +361,29 @@ fn cmd_build_opq(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_build_diskann(args: &[String]) -> Result<(), String> {
-    let (_, output, dim, records) = load_build_input(args)?;
     let metric = flag_value(args, "--metric").map_or(Ok(Metric::Cosine), parse_metric)?;
     let r: usize = parse_flag(args, "-r", 32)?;
     let l_build: usize = parse_flag(args, "--l-build", 96)?;
     let alpha: f32 = parse_flag(args, "--alpha", 1.2)?;
     let pq_m: usize = parse_flag(args, "--pq-m", 16)?;
     let ksub: usize = parse_flag(args, "--ksub", 256)?;
-    if !dim.is_multiple_of(pq_m) {
-        return Err(format!("--pq-m {pq_m} must divide dim {dim}"));
-    }
+
     if has_flag(args, "--streaming") {
-        // Low-memory build: never holds all raw vectors resident. `--sample`
-        // bounds the PQ-training set.
+        // Low-memory build: the CSV is consumed lazily (one record at a time)
+        // and the raw vectors are never all resident. `--sample` bounds the
+        // PQ-training set.
+        if args.len() < 2 {
+            return Err("expected <in.csv> <out.vecdb>".into());
+        }
+        let input = &args[0];
+        let output = &args[1];
+        let dim = peek_csv_dim(input)?;
+        if !dim.is_multiple_of(pq_m) {
+            return Err(format!("--pq-m {pq_m} must divide dim {dim}"));
+        }
         let sample: usize = parse_flag(args, "--sample", 50_000)?;
-        let n = records.len();
         DiskAnnIndex::build_streaming(
-            &output,
+            output,
             dim,
             metric,
             r,
@@ -316,13 +392,20 @@ fn cmd_build_diskann(args: &[String]) -> Result<(), String> {
             pq_m,
             ksub,
             sample,
-            records.into_iter(),
+            CsvStream::open(input)?,
         )
         .map_err(|e| e.to_string())?;
+        // `open` reads only the small resident tier (ids/codebooks/codes).
+        let n = DiskAnnIndex::open(output).map_err(|e| e.to_string())?.len();
         println!(
             "built diskann (streaming): {n} vectors (dim {dim}, {metric:?}, R {r}, sample {sample}) -> {output}"
         );
         return Ok(());
+    }
+
+    let (_, output, dim, records) = load_build_input(args)?;
+    if !dim.is_multiple_of(pq_m) {
+        return Err(format!("--pq-m {pq_m} must divide dim {dim}"));
     }
     let idx = DiskAnnIndex::build(&records, metric, r, l_build, alpha, pq_m, ksub);
     idx.save(&output).map_err(|e| e.to_string())?;
