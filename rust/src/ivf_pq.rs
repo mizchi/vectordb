@@ -348,6 +348,13 @@ impl IvfPqIndex {
 
     /// Serialize the index to an IVF+PQ `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize the index to the in-memory IVF+PQ `.vecdb` byte image that
+    /// [`save`](Self::save) writes (byte-identical), for a filesystem-free
+    /// "bytes in / bytes out" round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let l = self.layout();
         let has_raw = self.raw.is_some();
         let mut b = vec![0u8; l.total];
@@ -373,12 +380,18 @@ impl IvfPqIndex {
         if let Some(rb) = self.raw.as_ref() {
             write_f32s(&mut b, l.raw, rb);
         }
-        std::fs::write(path, &b)
+        b
     }
 
     /// Load an IVF+PQ `.vecdb` file.
     pub fn load(path: impl AsRef<Path>) -> io::Result<IvfPqIndex> {
-        let b = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse an IVF+PQ index from a `.vecdb` byte image (the "bytes in"
+    /// counterpart to [`to_bytes`](Self::to_bytes)). Performs the same validation
+    /// as [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<IvfPqIndex> {
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("ivfpq: {m}"));
         if b.len() < 64 || &b[0..8] != IP_MAGIC {
             return Err(bad("bad magic"));
@@ -417,8 +430,8 @@ impl IvfPqIndex {
         if b.len() < l.total {
             return Err(bad("file truncated"));
         }
-        idx.centroids = read_f32s(&b, l.centroids, nlist * dim);
-        idx.pq_codebooks = read_f32s(&b, l.codebooks, m * ksub * dsub);
+        idx.centroids = read_f32s(b, l.centroids, nlist * dim);
+        idx.pq_codebooks = read_f32s(b, l.codebooks, m * ksub * dsub);
         idx.offsets = (0..=nlist)
             .map(|i| {
                 let o = l.offsets + i * 8;
@@ -437,7 +450,7 @@ impl IvfPqIndex {
             .collect();
         idx.codes = b[l.codes..l.codes + count * m].to_vec();
         if has_raw {
-            idx.raw = Some(read_f32s(&b, l.raw, count * dim));
+            idx.raw = Some(read_f32s(b, l.raw, count * dim));
         }
         Ok(idx)
     }
@@ -546,6 +559,24 @@ mod tests {
         let got = idx.search_filter(&items[0].1, 10, 8, 16, |id| id % 2 == 0);
         assert!(!got.is_empty());
         assert!(got.iter().all(|h| h.id % 2 == 0));
+    }
+
+    #[test]
+    fn ivfpq_bytes_roundtrip() {
+        let dim = 48;
+        let items = clustered(800, dim, 16);
+        let idx = IvfPqIndex::build(&items, Metric::L2, 24, 12, 128, 12, true);
+        let b = idx.to_bytes();
+        let loaded = IvfPqIndex::from_bytes(&b).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.nlist(), idx.nlist());
+        for t in 0..15 {
+            let q = &items[t * 29 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 8, 8).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = loaded.search(q, 10, 8, 8).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(loaded.to_bytes(), b); // byte-stable round trip
     }
 
     #[test]

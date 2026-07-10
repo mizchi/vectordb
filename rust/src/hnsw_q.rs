@@ -451,6 +451,13 @@ fn align16(x: usize) -> usize {
 impl HnswQIndex {
     /// Serialize the graph to a quantized-HNSW `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize the graph to the in-memory quantized-HNSW `.vecdb` byte image
+    /// that [`save`](Self::save) writes (byte-identical), for a filesystem-free
+    /// "bytes in / bytes out" round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let dim = self.dim;
         let count = self.len();
         let has_raw = self.raw.is_some();
@@ -519,12 +526,18 @@ impl HnswQIndex {
                 b[raw_off + i * 4..raw_off + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
             }
         }
-        std::fs::write(path, &b)
+        b
     }
 
     /// Load a quantized-HNSW `.vecdb` file.
     pub fn load(path: impl AsRef<Path>) -> io::Result<HnswQIndex> {
-        let b = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse a quantized-HNSW index from a `.vecdb` byte image (the "bytes in"
+    /// counterpart to [`to_bytes`](Self::to_bytes)). Performs the same validation
+    /// as [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<HnswQIndex> {
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("hnsw_q: {m}"));
         if b.len() < 64 || &b[0..8] != HQ_MAGIC {
             return Err(bad("bad magic"));
@@ -733,6 +746,21 @@ mod tests {
         let (idx, items) = build(Metric::L2, true);
         let got = idx.search_filter(&items[0].1, 10, 128, |id| id % 3 == 0);
         assert!(got.iter().all(|h| h.id % 3 == 0));
+    }
+
+    #[test]
+    fn quantized_hnsw_bytes_roundtrip() {
+        let (idx, items) = build(Metric::L2, true);
+        let b = idx.to_bytes();
+        let idx2 = HnswQIndex::from_bytes(&b).unwrap();
+        assert_eq!(idx2.len(), idx.len());
+        for t in 0..20 {
+            let q = &items[t * 41 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 64).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = idx2.search(q, 10, 64).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(idx2.to_bytes(), b); // byte-stable round trip
     }
 
     #[test]

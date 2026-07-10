@@ -17,7 +17,7 @@
 use crate::distance::{dot_f32, l2sq_f32};
 use crate::index::{push_bounded, Hit, Metric, Ranked};
 use std::collections::BinaryHeap;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -382,6 +382,13 @@ fn pq_layout(
 impl PqIndex {
     /// Serialize the index to a PQ `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize the index to the in-memory PQ `.vecdb` byte image that
+    /// [`save`](Self::save) writes (byte-identical), for a filesystem-free
+    /// "bytes in / bytes out" round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let has_raw = self.raw.is_some();
         let l = pq_layout(self.dim, self.count, self.m, self.ksub, self.dsub, has_raw);
         let mut b = vec![0u8; l.total];
@@ -409,15 +416,18 @@ impl PqIndex {
                 b[o..o + 4].copy_from_slice(&x.to_le_bytes());
             }
         }
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(&b)?;
-        f.flush()?;
-        Ok(())
+        b
     }
 
     /// Load a PQ `.vecdb` file.
     pub fn load(path: impl AsRef<Path>) -> io::Result<PqIndex> {
-        let b = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse a PQ index from a `.vecdb` byte image (the "bytes in" counterpart to
+    /// [`to_bytes`](Self::to_bytes)). Performs the same validation as
+    /// [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<PqIndex> {
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("pq: {m}"));
         if b.len() < PQ_HEADER_LEN || &b[0..8] != PQ_MAGIC {
             return Err(bad("bad magic"));
@@ -574,6 +584,24 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pq_bytes_roundtrip() {
+        let dim = 48;
+        let items = clustered(500, dim, 16);
+        let pq = PqIndex::build(&items, Metric::L2, 12, 128, 12, true);
+        let b = pq.to_bytes();
+        let loaded = PqIndex::from_bytes(&b).unwrap();
+        assert_eq!(loaded.len(), pq.len());
+        assert_eq!(loaded.dim(), pq.dim());
+        for t in 0..15 {
+            let q = &items[t * 29 % items.len()].1;
+            let a: Vec<u64> = pq.search(q, 10, 8).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = loaded.search(q, 10, 8).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(loaded.to_bytes(), b); // byte-stable round trip
     }
 
     #[cfg(feature = "parallel")]

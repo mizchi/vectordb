@@ -1,0 +1,7 @@
+import {
+  "mizchi/vectordb",
+  "moonbitlang/core/string",
+  "moonbitlang/core/encoding/utf8",
+}
+
+warnings = "-alert_experimental"

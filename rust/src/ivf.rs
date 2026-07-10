@@ -528,6 +528,13 @@ fn get_f32s(b: &[u8], off: usize, n: usize) -> Vec<f32> {
 impl IvfIndex {
     /// Serialize to an IVF `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize to the in-memory IVF `.vecdb` byte image that [`save`](Self::save)
+    /// writes (byte-identical), for a filesystem-free "bytes in / bytes out"
+    /// round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let dim = self.dim;
         let count = self.len();
         let has_raw = self.raw.is_some();
@@ -567,15 +574,18 @@ impl IvfIndex {
             }
         }
 
-        std::fs::write(path, &buf)
+        buf
     }
 
-    /// Load an IVF `.vecdb` file (parsed via mmap, then copied into owned Vecs).
+    /// Load an IVF `.vecdb` file into an owned index (copies data).
     pub fn load(path: impl AsRef<Path>) -> io::Result<IvfIndex> {
-        let file = std::fs::File::open(path)?;
-        // SAFETY: read-only mmap of a regular file held open for the call.
-        let m = unsafe { memmap2::Mmap::map(&file)? };
-        let b: &[u8] = &m;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse an owned IVF index from a `.vecdb` byte image (the "bytes in"
+    /// counterpart to [`to_bytes`](Self::to_bytes)). Performs the same
+    /// validation as [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<IvfIndex> {
         let bad = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, format!("ivf: {msg}"));
         if b.len() < IVF_HEADER_LEN || &b[0..8] != IVF_MAGIC {
             return Err(bad("bad magic"));
@@ -874,6 +884,24 @@ mod tests {
             b.iter().map(|h| h.id).collect::<Vec<_>>()
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ivf_bytes_roundtrip() {
+        let items = make_items();
+        let mut idx = IvfIndex::build(2, Metric::L2, 4, &items, true, 15);
+        idx.remove(items[0].0); // exercise the tombstone section too
+        let b = idx.to_bytes();
+        let idx2 = IvfIndex::from_bytes(&b).unwrap();
+        assert_eq!(idx2.len(), idx.len());
+        assert_eq!(idx2.nlist(), idx.nlist());
+        assert_eq!(idx2.live_len(), idx.live_len());
+        for q in [[10.0, 10.0], [0.0, 0.0], [10.0, 0.0]] {
+            let a: Vec<u64> = idx.search(&q, 3, 4, 8).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = idx2.search(&q, 3, 4, 8).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(idx2.to_bytes(), b); // byte-stable round trip
     }
 
     #[cfg(feature = "parallel")]

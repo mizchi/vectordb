@@ -757,6 +757,13 @@ impl DiskAnnIndex {
 
     /// Serialize the index to a DiskANN `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize the index to the in-memory DiskANN `.vecdb` byte image that
+    /// [`save`](Self::save) writes (byte-identical), for a filesystem-free
+    /// "bytes in / bytes out" round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let edges = self.edge_count();
         let l = self.layout(edges);
         let mut b = vec![0u8; l.total];
@@ -792,12 +799,18 @@ impl DiskAnnIndex {
         put_f32s(&mut b, l.codebooks, &self.codebooks);
         b[l.codes..l.codes + self.codes.len()].copy_from_slice(&self.codes);
         put_f32s(&mut b, l.raw, &self.vectors);
-        std::fs::write(path, &b)
+        b
     }
 
-    /// Load a DiskANN `.vecdb` file.
+    /// Load a DiskANN `.vecdb` file into an owned index (copies data).
     pub fn load(path: impl AsRef<Path>) -> io::Result<DiskAnnIndex> {
-        let b = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse an owned DiskANN index from a `.vecdb` byte image (the "bytes in"
+    /// counterpart to [`to_bytes`](Self::to_bytes)). Performs the same validation
+    /// as [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<DiskAnnIndex> {
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("diskann: {m}"));
         if b.len() < 64 || &b[0..8] != DA_MAGIC {
             return Err(bad("bad magic"));
@@ -866,9 +879,9 @@ impl DiskAnnIndex {
         }
         idx.graph = graph;
         idx.ids = (0..count).map(|i| u64_at(l.ids + i * 8)).collect();
-        idx.codebooks = get_f32s(&b, l.codebooks, m * ksub * dsub);
+        idx.codebooks = get_f32s(b, l.codebooks, m * ksub * dsub);
         idx.codes = b[l.codes..l.codes + count * m].to_vec();
-        idx.vectors = get_f32s(&b, l.raw, count * dim);
+        idx.vectors = get_f32s(b, l.raw, count * dim);
         Ok(idx)
     }
 
@@ -1192,6 +1205,23 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn diskann_bytes_roundtrip() {
+        let dim = 48;
+        let items = clustered(1200, dim, 20);
+        let idx = DiskAnnIndex::build(&items, Metric::L2, 24, 64, 1.2, 12, 128);
+        let b = idx.to_bytes();
+        let loaded = DiskAnnIndex::from_bytes(&b).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        for t in 0..15 {
+            let q = &items[t * 29 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 64).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = loaded.search(q, 10, 64).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(loaded.to_bytes(), b); // byte-stable round trip
     }
 
     #[test]

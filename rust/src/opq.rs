@@ -514,6 +514,13 @@ impl OpqIndex {
 
     /// Serialize the index to an OPQ `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize the index to the in-memory OPQ `.vecdb` byte image that
+    /// [`save`](Self::save) writes (byte-identical), for a filesystem-free
+    /// "bytes in / bytes out" round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let l = self.layout();
         let has_raw = self.raw.is_some();
         let mut b = vec![0u8; l.total];
@@ -535,12 +542,18 @@ impl OpqIndex {
         if let Some(rb) = self.raw.as_ref() {
             write_f32s(&mut b, l.raw, rb);
         }
-        std::fs::write(path, &b)
+        b
     }
 
     /// Load an OPQ `.vecdb` file.
     pub fn load(path: impl AsRef<Path>) -> io::Result<OpqIndex> {
-        let b = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse an OPQ index from a `.vecdb` byte image (the "bytes in" counterpart
+    /// to [`to_bytes`](Self::to_bytes)). Performs the same validation as
+    /// [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<OpqIndex> {
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("opq: {m}"));
         if b.len() < 64 || &b[0..8] != OP_MAGIC {
             return Err(bad("bad magic"));
@@ -576,8 +589,8 @@ impl OpqIndex {
         if b.len() < l.total {
             return Err(bad("file truncated"));
         }
-        idx.rot = read_f32s(&b, l.rot, dim * dim);
-        idx.pq_codebooks = read_f32s(&b, l.codebooks, m * ksub * dsub);
+        idx.rot = read_f32s(b, l.rot, dim * dim);
+        idx.pq_codebooks = read_f32s(b, l.codebooks, m * ksub * dsub);
         idx.ids = (0..count)
             .map(|i| {
                 let o = l.ids + i * 8;
@@ -588,7 +601,7 @@ impl OpqIndex {
             .collect();
         idx.codes = b[l.codes..l.codes + count * m].to_vec();
         if has_raw {
-            idx.raw = Some(read_f32s(&b, l.raw, count * dim));
+            idx.raw = Some(read_f32s(b, l.raw, count * dim));
         }
         Ok(idx)
     }
@@ -749,6 +762,23 @@ mod tests {
         let got = opq.search_filter(&items[0].1, 10, 8, |id| id % 4 == 0);
         assert!(!got.is_empty());
         assert!(got.iter().all(|h| h.id % 4 == 0));
+    }
+
+    #[test]
+    fn opq_bytes_roundtrip() {
+        let dim = 32;
+        let items = skewed(2000, dim);
+        let idx = OpqIndex::build(&items, Metric::L2, 8, 256, 15, 4, true);
+        let b = idx.to_bytes();
+        let loaded = OpqIndex::from_bytes(&b).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        for t in 0..10 {
+            let q = &items[t * 41 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 16).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = loaded.search(q, 10, 16).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(loaded.to_bytes(), b); // byte-stable round trip
     }
 
     #[test]

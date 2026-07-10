@@ -17,7 +17,7 @@
 use crate::index::{FlatIndex, Metric, View};
 use memmap2::Mmap;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::mem::{align_of, size_of};
 use std::path::Path;
 
@@ -102,6 +102,16 @@ fn layout(
 /// [`FlatIndex::compact`] first if you would rather drop tombstoned rows
 /// entirely instead of carrying them across the round-trip.
 pub fn save(index: &FlatIndex, path: impl AsRef<Path>) -> io::Result<()> {
+    std::fs::write(path, to_bytes(index))
+}
+
+/// Serialize an index to the in-memory `.vecdb` byte image that [`save`] writes.
+///
+/// The bytes are identical to what [`save`] produces on disk; use this for a
+/// "bytes in / bytes out" round trip that never touches the filesystem (pair
+/// with [`from_bytes`]). Soft-delete tombstones and metadata payloads are
+/// included when present.
+pub fn to_bytes(index: &FlatIndex) -> Vec<u8> {
     let dim = index.dim();
     let count = index.len();
     let has_raw = index.has_raw();
@@ -171,10 +181,7 @@ pub fn save(index: &FlatIndex, path: impl AsRef<Path>) -> io::Result<()> {
         buf[off..off + blob.len()].copy_from_slice(blob);
     }
 
-    let mut f = File::create(path)?;
-    f.write_all(&buf)?;
-    f.flush()?;
-    Ok(())
+    buf
 }
 
 fn write_slice<T: Copy>(buf: &mut [u8], off: usize, data: &[T]) {
@@ -253,20 +260,6 @@ impl MmapIndex {
                     .map(|p| std::slice::from_raw_parts(p, self.count * self.dim)),
                 deleted: self.deleted.as_deref(),
             }
-        }
-    }
-
-    /// Raw payload bytes of row `i` (by position, ignoring liveness), or `None`
-    /// when empty / absent. Backed by the mmap'd blob.
-    fn payload_at(&self, i: usize) -> Option<&[u8]> {
-        let offs = self.payload_offsets.as_ref()?;
-        let blob = self.payload_blob?;
-        let (s, e) = (offs[i], offs[i + 1]);
-        if e > s {
-            // SAFETY: [s, e) lies within the blob section (checked at open).
-            Some(unsafe { std::slice::from_raw_parts(blob.add(s), e - s) })
-        } else {
-            None
         }
     }
 
@@ -416,25 +409,88 @@ pub fn open(path: impl AsRef<Path>) -> io::Result<MmapIndex> {
 /// Load a `.vecdb` file into an owned, mutable [`FlatIndex`] (copies data).
 /// Persisted tombstones and payloads are restored.
 pub fn load(path: impl AsRef<Path>) -> io::Result<FlatIndex> {
-    let m = open(path)?;
-    let v = m.view();
-    let n = v.ids.len();
-    let mut idx = FlatIndex::new(v.dim, v.metric, v.has_raw());
-    idx.ids.extend_from_slice(v.ids);
-    idx.scales.extend_from_slice(v.scales);
-    idx.sqnorms.extend_from_slice(v.sqnorms);
-    idx.codes.extend_from_slice(v.codes);
-    if let Some(raw) = v.raw {
-        idx.raw.as_mut().unwrap().extend_from_slice(raw);
+    from_bytes(&std::fs::read(path)?)
+}
+
+/// Parse an owned, mutable [`FlatIndex`] from a `.vecdb` byte image (copies data
+/// out of the slice). This is the "bytes in" counterpart to [`to_bytes`]: it
+/// reconstructs exactly what [`load`] returns, restoring persisted tombstones
+/// and payloads, and performs the same validation (magic, version, truncation,
+/// payload-offset) as [`open`]/[`load`], returning the same [`io::Error`]s.
+pub fn from_bytes(b: &[u8]) -> io::Result<FlatIndex> {
+    if b.len() < HEADER_LEN {
+        return Err(bad("file smaller than header"));
     }
-    idx.deleted = match &m.deleted {
-        Some(d) => d.clone(),
-        None => vec![false; n],
+    if &b[0..8] != MAGIC {
+        return Err(bad("bad magic"));
+    }
+    let version = read_u32(b, 8);
+    if version != VERSION {
+        return Err(bad("unsupported version"));
+    }
+    let metric = Metric::from_u32(read_u32(b, 12)).ok_or_else(|| bad("bad metric"))?;
+    let dim = read_u32(b, 16) as usize;
+    let count = read_u32(b, 20) as usize;
+    let flags = read_u32(b, 24);
+    let has_raw = flags & FLAG_HAS_RAW != 0;
+    let has_deleted = flags & FLAG_HAS_DELETED != 0;
+    let has_payloads = flags & FLAG_HAS_PAYLOADS != 0;
+    if dim == 0 {
+        return Err(bad("zero dim"));
+    }
+
+    // Same two-pass layout resolution as `open`: probe to find the payload
+    // offsets section, read the real blob length, then recompute the layout.
+    let probe = layout(dim, count, has_raw, has_deleted, has_payloads.then_some(0));
+    if b.len() < probe.total {
+        return Err(bad("file truncated"));
+    }
+    let blob_len = if has_payloads {
+        let po = probe.payload_offsets.unwrap();
+        if b.len() < po + (count + 1) * size_of::<u64>() {
+            return Err(bad("file truncated"));
+        }
+        Some(read_u64(b, po + count * size_of::<u64>()) as usize)
+    } else {
+        None
     };
-    idx.deleted_count = idx.deleted.iter().filter(|&&x| x).count();
-    idx.payloads = (0..n)
-        .map(|i| m.payload_at(i).map(|p| p.to_vec()).unwrap_or_default())
+    let l = layout(dim, count, has_raw, has_deleted, blob_len);
+    if b.len() < l.total {
+        return Err(bad("file truncated"));
+    }
+
+    let mut idx = FlatIndex::new(dim, metric, has_raw);
+    idx.ids = (0..count)
+        .map(|i| read_u64(b, l.ids + i * size_of::<u64>()))
         .collect();
+    idx.scales = read_f32s(b, l.scales, count);
+    idx.sqnorms = read_f32s(b, l.sqnorms, count);
+    idx.codes = (0..count * dim).map(|i| b[l.codes + i] as i8).collect();
+    if let Some(off) = l.raw {
+        idx.raw = Some(read_f32s(b, off, count * dim));
+    }
+    let deleted: Vec<bool> = match l.deleted {
+        Some(off) => (0..count).map(|i| b[off + i] != 0).collect(),
+        None => vec![false; count],
+    };
+    idx.deleted_count = deleted.iter().filter(|&&x| x).count();
+    idx.deleted = deleted;
+    idx.payloads = match (l.payload_offsets, l.payload_blob) {
+        (Some(po), Some(pb)) => {
+            let offs: Vec<usize> = (0..=count)
+                .map(|i| read_u64(b, po + i * size_of::<u64>()) as usize)
+                .collect();
+            // Validate monotonicity and bounds against the blob section.
+            let blen = blob_len.unwrap_or(0);
+            if offs[0] != 0 || offs[count] != blen || offs.windows(2).any(|w| w[1] < w[0]) {
+                return Err(bad("bad payload offsets"));
+            }
+            (0..count)
+                .map(|i| b[pb + offs[i]..pb + offs[i + 1]].to_vec())
+                .collect()
+        }
+        _ => vec![Vec::new(); count],
+    };
     Ok(idx)
 }
 
@@ -454,6 +510,15 @@ fn read_u64(b: &[u8], off: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[off..off + 8]);
     u64::from_le_bytes(a)
+}
+
+fn read_f32s(b: &[u8], off: usize, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let o = off + i * 4;
+            f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+        })
+        .collect()
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -559,6 +624,38 @@ mod tests {
         let l = layout(3, 2, true, false, None);
         assert_eq!(bytes.len(), l.total);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bytes_roundtrip_payloads_and_tombstone() {
+        // to_bytes / from_bytes exercise the payload and tombstone sections
+        // without touching the filesystem.
+        let mut idx = FlatIndex::new(4, Metric::L2, true);
+        idx.add_with_payload(1, &[1.0, 0.0, 0.0, 0.0], b"first");
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]); // no payload
+        idx.add_with_payload(3, &[0.0, 0.0, 1.0, 0.0], b"third-doc");
+        idx.remove(2); // tombstone the middle row
+
+        let bytes = to_bytes(&idx);
+        let idx2 = from_bytes(&bytes).unwrap();
+
+        // Search ids agree between original and reconstructed index.
+        for q in [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.5, 0.5, 0.5, 0.5],
+        ] {
+            let a: Vec<u64> = idx.search(&q, 3, 4).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = idx2.search(&q, 3, 4).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+            assert!(a.iter().all(|&id| id != 2)); // tombstoned row excluded
+        }
+        // Payloads and tombstone survived.
+        assert_eq!(idx2.payload(1), Some(&b"first"[..]));
+        assert_eq!(idx2.payload(3), Some(&b"third-doc"[..]));
+        assert_eq!(idx2.live_len(), 2);
+        // Byte-stable round trip.
+        assert_eq!(to_bytes(&idx2), bytes);
     }
 
     #[test]

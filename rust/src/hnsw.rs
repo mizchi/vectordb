@@ -387,6 +387,13 @@ fn align16(x: usize) -> usize {
 impl HnswIndex {
     /// Serialize the graph to an HNSW `.vecdb` file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    /// Serialize the graph to the in-memory HNSW `.vecdb` byte image that
+    /// [`save`](Self::save) writes (byte-identical), for a filesystem-free
+    /// "bytes in / bytes out" round trip. Pair with [`from_bytes`](Self::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
         let dim = self.dim;
         let count = self.len();
         let mut links_bytes = 0usize;
@@ -457,12 +464,18 @@ impl HnswIndex {
                 b[deleted_off + i] = d as u8;
             }
         }
-        std::fs::write(path, &b)
+        b
     }
 
     /// Load an HNSW `.vecdb` file.
     pub fn load(path: impl AsRef<Path>) -> io::Result<HnswIndex> {
-        let b = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse an HNSW index from a `.vecdb` byte image (the "bytes in" counterpart
+    /// to [`to_bytes`](Self::to_bytes)). Performs the same validation as
+    /// [`load`](Self::load) and returns the same [`io::Error`]s.
+    pub fn from_bytes(b: &[u8]) -> io::Result<HnswIndex> {
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("hnsw: {m}"));
         if b.len() < 64 || &b[0..8] != HNSW_MAGIC {
             return Err(bad("bad magic"));
@@ -666,6 +679,21 @@ mod tests {
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn hnsw_bytes_roundtrip() {
+        let (idx, items) = build(Metric::L2);
+        let b = idx.to_bytes();
+        let idx2 = HnswIndex::from_bytes(&b).unwrap();
+        assert_eq!(idx2.len(), idx.len());
+        for t in 0..20 {
+            let q = &items[t * 41 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 64).iter().map(|h| h.id).collect();
+            let c: Vec<u64> = idx2.search(q, 10, 64).iter().map(|h| h.id).collect();
+            assert_eq!(a, c);
+        }
+        assert_eq!(idx2.to_bytes(), b); // byte-stable round trip
     }
 
     #[test]

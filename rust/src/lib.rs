@@ -18,6 +18,7 @@
 //! ```
 
 pub mod bin_quant;
+pub mod cli;
 pub mod diskann;
 pub mod distance;
 pub mod hnsw;
@@ -42,4 +43,4 @@ pub use opq::OpqIndex;
 pub use pq::PqIndex;
 pub use quantize::{quantize, Quantized};
 pub use rabitq::{IvfRabitqIndex, RabitqIndex};
-pub use storage::{load, open, save, MmapIndex};
+pub use storage::{from_bytes, load, open, save, to_bytes, MmapIndex};

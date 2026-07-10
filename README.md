@@ -445,6 +445,33 @@ $V search da.vecdb    query.csv -k 10 --ef 64          # DiskANN は --ef = l_se
 | `search` | `-k` `--oversample` `--nprobe` `--ef` | 種別自動判定 |
 | `info` | — | 種別・件数・次元・メトリクスなど |
 
+### IO 抽象化で任意の環境に組み込む（`vectordb::cli`）
+
+CLI のコマンドロジックは `Env` トレイト（`read` / `write` / `print` / `eprint`）越しにしか
+IO しない。索引は**バイト API**（各索引の `to_bytes` / `from_bytes`）で入出力するのでパスに触れず、
+**実ファイル・完全インメモリ・任意のホスト**で同じ `run` が動く。付属アダプタ:
+
+- **`StdEnv`** — 実ファイルシステム + stdio（`vecdb` バイナリの既定）。
+- **`MemEnv`** — 完全インメモリ（実 IO なし）。テスト・サンドボックス・FS の無い環境向け。
+- 独自環境は `Env` を実装すれば差し込める（オブジェクトストレージ、`fetch` など）。
+
+```rust
+use vectordb::cli::{run, MemEnv};
+
+let mut env = MemEnv::new();
+env.put_str("vecs.csv", "0,1,0,0\n1,0,1,0\n2,0.9,0.1,0\n");
+run(&mut env, &["build","vecs.csv","idx.vecdb","--metric","cosine"].map(String::from))?;
+env.put_str("q.csv", "0,1,0.05,0\n");
+run(&mut env, &["search","idx.vecdb","q.csv","-k","2"].map(String::from))?;
+// 書き出した索引バイトも、検索結果の出力も env から取り出せる（ファイル不要）
+let bytes = env.get("idx.vecdb").unwrap();
+print!("{}", env.output());
+```
+
+`vecdb` バイナリは `cli::run(&mut StdEnv::new(), &args)` を呼ぶ薄いラッパ。唯一の例外は
+`build-diskann --streaming`（一時ファイルへの spill と CSV の遅延読みで実ファイルが必須）で、
+これはバイナリ側に置いている。
+
 ---
 
 ## ファイル形式 `.vecdb`
@@ -535,6 +562,27 @@ let restored = @vectordb.FlatIndex::from_bytes(bytes)
 let hits = flat.search_filter(query, 10, 4, fn(id) { id % 2L == 0L })
 ```
 
+### CLI と IO 抽象化（`cli` パッケージ）
+
+Rust と同じく、CLI コマンドロジック（`build` / `search` / `info`）は `Io` アダプタ越しにしか
+IO しないので、**native / wasm / js / FS の無いホスト**で同じ `run(io, args)` が動く。索引は
+`to_bytes` / `from_bytes` でやり取りする。
+
+- **`Io::new(read, write, print)`** — 3 つのクロージャを渡す汎用アダプタ（任意のホスト環境）。
+- **`MemFs`** — 完全インメモリ。実 IO が無いので**全バックエンド**（wasm 含む）で動く。
+
+```moonbit
+let fs = @cli.MemFs::new()
+fs.put_str("vecs.csv", "0,1,0,0\n1,0,1,0\n2,0.9,0.1,0\n")
+@cli.run(fs.io(), ["build", "vecs.csv", "idx.vecdb", "--metric", "cosine"]) |> ignore
+@cli.run(fs.io(), ["search", "idx.vecdb", "q.csv", "-k", "3"]) |> ignore
+println(fs.output())          // 検索結果（ファイル不要）
+```
+
+MoonBit は argv/実 FS のアクセスがバックエンド間で不安定なため、CLI コアはホストが args と IO を
+注入する形（`run(io, args)`）。実行デモは `moon run cmd/cli --target native`（`MemFs` にファイルを
+載せて build → info → search を実演）。
+
 ### SIMD の効くターゲット
 
 SIMD intrinsic はスカラ fallback を持つため `native` / `wasm` / `js` すべてで動くが、
@@ -583,14 +631,16 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、入
 - `bin_quant.rs` / `rabitq.rs` — binary(1-bit) / RaBitQ + IVF+RaBitQ
 - `pq.rs` / `opq.rs` / `ivf_pq.rs` — PQ（共有プリミティブ）/ OPQ / IVF+PQ
 - `diskann.rs` — DiskANN/Vamana（単層グラフ + RobustPrune + PQ 常駐 + rerank + streaming build）
-- `storage.rs` — `.vecdb` の save / mmap open / load（tombstone/payload 永続化含む）
-- `bin/vecdb.rs` — CLI、`examples/` — bench / eval / dump / dogfood_streaming
+- `storage.rs` — `.vecdb` の save / mmap open / load + 全索引の `to_bytes` / `from_bytes`
+- `cli.rs` — IO 抽象化した CLI コア（`Env` / `StdEnv` / `MemEnv` + `run`）
+- `bin/vecdb.rs` — `StdEnv` に配線した薄い CLI、`examples/` — bench / eval / dump / dogfood_streaming
 
 ### MoonBit（`moonbit/`）
 
 `distance.mbt` / `quantize.mbt` / `index.mbt` / `ivf.mbt` / `hnsw.mbt` / `hnsw_q.mbt` /
 `bin_quant.mbt` / `rabitq.mbt` / `ivf_rabitq.mbt` / `pq.mbt` / `ivf_pq.mbt` / `opq.mbt` /
-`storage.mbt`（`.vecdb` 相互運用）。
+`storage.mbt`（`.vecdb` 相互運用）、`cli/`（IO 抽象化 CLI: `Io` / `MemFs` / `run`）、
+`cmd/cli`（実行デモ）。
 
 設計の経緯・アルゴリズムの詳細・調査ノートは [`DESIGN.md`](./DESIGN.md)。
 
