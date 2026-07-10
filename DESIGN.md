@@ -144,7 +144,8 @@ query(f32)
 
 ### インデックス（Rust のみ）
 - **DiskANN / Vamana**: 単層グラフ + `RobustPrune`（α枝刈り）、PQ 常駐で探索を誘導し
-  生 f32 で rerank。大規模・省メモリ（SSD 常駐）志向の最小実装（`VECDBDA1`）。
+  生 f32 で rerank（`VECDBDA1`）。`open()` で **mmap 常駐探索**（グラフ＋生はマップ上、
+  RAM は PQ コードのみ = 次元非依存の `count*m` バイト）。構築は in-memory の最小版。
 
 ### 量子化（Rust）
 - int8 スカラ / **binary(1-bit, Hamming)** / **RaBitQ(回転+符号+不偏推定)** /
@@ -182,5 +183,5 @@ query(f32)
 
 - MoonBit への 並列 / mmap 相当の移植（インデックス・量子化はほぼ全て移植済み）。
 - フィルタ選択率に応じた探索の適応化、GPU/バッチ ADC の SIMD 最適化。
-- DiskANN の真のディスク常駐化（現状は最小版: in-memory 構築 + mmap reload）、FreshDiskANN 相当の逐次更新。
+- DiskANN の構築自体のディスク/ストリーミング化（探索は mmap 常駐化済み; 構築は in-memory）、FreshDiskANN 相当の逐次更新。
 - IVF の削除後リバランス、HNSW の逐次削除（現状 compact は再構築）。

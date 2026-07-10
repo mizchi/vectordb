@@ -206,7 +206,7 @@ footer .mono{font-size:12px}
       <div class="card"><span class="tag">nprobe</span><h3>IVF</h3><p>k-means++ cells; scan only the <span class="mono">nprobe</span> nearest. Best recall/throughput balance.</p></div>
       <div class="card"><span class="tag">graph</span><h3>HNSW</h3><p>Multi-layer proximity graph with the diversity heuristic. Highest throughput at high recall.</p></div>
       <div class="card"><span class="tag">graph · ¼ mem</span><h3>int8-HNSW</h3><p>Same graph, int8 nodes (~¼ the vector memory). Built &amp; searched in quantized space, f32-reranked.</p></div>
-      <div class="card"><span class="tag">single-layer · SSD</span><h3>DiskANN</h3><p>Vamana graph with RobustPrune. PQ codes resident in RAM steer traversal; raw f32 read only to rerank. Built for scale.</p></div>
+      <div class="card"><span class="tag">single-layer · mmap</span><h3>DiskANN</h3><p>Vamana graph with RobustPrune. Graph + raw vectors stay mmap'd; only PQ codes are RAM-resident and steer traversal. RAM ∝ count·m, not dim.</p></div>
     </div>
   </section>
 

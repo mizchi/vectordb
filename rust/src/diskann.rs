@@ -528,6 +528,208 @@ impl DiskAnnIndex {
         idx.vectors = get_f32s(&b, l.raw, count * dim);
         Ok(idx)
     }
+
+    /// Open a DiskANN `.vecdb` file as a **disk-resident** index: the graph
+    /// adjacency and raw f32 vectors stay in the mmap (read lazily, per hop /
+    /// at rerank), while only the small PQ codes + codebooks are copied into
+    /// RAM. This is the DiskANN operating mode — RAM footprint is ~`count * m`
+    /// bytes regardless of vector dimension.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<MmapDiskAnn> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only mmap of a regular file held open for the call.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("diskann: {m}"));
+        let b: &[u8] = &mmap;
+        if b.len() < 64 || &b[0..8] != DA_MAGIC {
+            return Err(bad("bad magic"));
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        if u32_at(8) != DA_VERSION {
+            return Err(bad("unsupported version"));
+        }
+        let metric = Metric::from_u32(u32_at(12)).ok_or_else(|| bad("bad metric"))?;
+        let dim = u32_at(16) as usize;
+        let count = u32_at(20) as usize;
+        let r = u32_at(24) as usize;
+        let entry = u32_at(28);
+        let m = u32_at(32) as usize;
+        let ksub = u32_at(36) as usize;
+        if dim == 0 || m == 0 || !dim.is_multiple_of(m) {
+            return Err(bad("bad dim/m"));
+        }
+        let dsub = dim / m;
+        let goff = align16(64);
+        if b.len() < goff + (count + 1) * 8 {
+            return Err(bad("truncated"));
+        }
+        let edges = read_u64(b, goff + count * 8) as usize;
+        let gnbr = align16(goff + (count + 1) * 8);
+        let ids_off = align16(gnbr + edges * 4);
+        let codebooks_off = align16(ids_off + count * 8);
+        let codes_off = align16(codebooks_off + m * ksub * dsub * 4);
+        let raw_off = align16(codes_off + count * m);
+        if b.len() < align16(raw_off + count * dim * 4) {
+            return Err(bad("file truncated"));
+        }
+        // Resident (RAM) tier: ids, codebooks, PQ codes.
+        let ids: Vec<u64> = (0..count).map(|i| read_u64(b, ids_off + i * 8)).collect();
+        let codebooks = get_f32s(b, codebooks_off, m * ksub * dsub);
+        let codes = b[codes_off..codes_off + count * m].to_vec();
+        Ok(MmapDiskAnn {
+            _mmap: mmap,
+            dim,
+            metric,
+            count,
+            entry,
+            m,
+            ksub,
+            goff,
+            gnbr,
+            raw_off,
+            ids,
+            codebooks,
+            codes,
+            _r: r,
+        })
+    }
+}
+
+/// A disk-resident DiskANN index: graph + raw vectors live in the mmap, only
+/// the PQ codes/codebooks are RAM-resident. See [`DiskAnnIndex::open`].
+pub struct MmapDiskAnn {
+    _mmap: memmap2::Mmap,
+    dim: usize,
+    metric: Metric,
+    count: usize,
+    entry: u32,
+    m: usize,
+    ksub: usize,
+    goff: usize,    // CSR offsets section
+    gnbr: usize,    // CSR neighbors section
+    raw_off: usize, // raw f32 section
+    ids: Vec<u64>,
+    codebooks: Vec<f32>,
+    codes: Vec<u8>,
+    _r: usize,
+}
+
+impl MmapDiskAnn {
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Out-neighbors of node `i`, read from the mmap'd CSR (models a page read).
+    fn neighbors(&self, i: u32) -> Vec<u32> {
+        let b: &[u8] = &self._mmap;
+        let base = self.goff + i as usize * 8;
+        let start = read_u64(b, base) as usize;
+        let end = read_u64(b, base + 8) as usize;
+        (start..end)
+            .map(|e| read_u32(b, self.gnbr + e * 4))
+            .collect()
+    }
+
+    /// Raw f32 vector of node `i`, read from the mmap (the "disk" read).
+    fn raw_at(&self, i: u32) -> Vec<f32> {
+        let b: &[u8] = &self._mmap;
+        let off = self.raw_off + i as usize * self.dim * 4;
+        (0..self.dim).map(|d| read_f32(b, off + d * 4)).collect()
+    }
+
+    /// Search for the `k` nearest neighbors, traversing the mmap'd graph with
+    /// PQ-approximate distances and reranking the beam with exact f32 read from
+    /// the map.
+    pub fn search(&self, query: &[f32], k: usize, l_search: usize) -> Vec<Hit> {
+        if k == 0 || self.count == 0 {
+            return Vec::new();
+        }
+        let processed = if self.metric == Metric::Cosine {
+            normalize(query)
+        } else {
+            query.to_vec()
+        };
+        let lut = build_lut(
+            &self.codebooks,
+            self.dim,
+            self.m,
+            self.ksub,
+            &processed,
+            true,
+        );
+        let adc = |node: u32| {
+            let c = &self.codes[node as usize * self.m..(node as usize + 1) * self.m];
+            adc_sum(&lut, self.ksub, c)
+        };
+        let l = l_search.max(k);
+
+        // Greedy beam over the disk-resident graph.
+        let mut list: Vec<(f32, u32)> = vec![(adc(self.entry), self.entry)];
+        let mut inserted: HashSet<u32> = HashSet::from([self.entry]);
+        let mut expanded: HashSet<u32> = HashSet::new();
+        loop {
+            let Some(pi) = list.iter().position(|&(_, n)| !expanded.contains(&n)) else {
+                break;
+            };
+            let p = list[pi].1;
+            expanded.insert(p);
+            for nb in self.neighbors(p) {
+                if inserted.insert(nb) {
+                    list.push((adc(nb), nb));
+                }
+            }
+            list.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if list.len() > l {
+                list.truncate(l);
+            }
+        }
+
+        // Exact rerank of the beam (reads raw vectors from the map).
+        let hib = self.metric.higher_is_better();
+        let mut scored: Vec<(f32, u32)> = list
+            .iter()
+            .map(|&(_, node)| {
+                let v = self.raw_at(node);
+                let key = match self.metric {
+                    Metric::L2 => l2sq_f32(&v, &processed),
+                    Metric::Dot | Metric::Cosine => -dot_f32(&v, &processed),
+                };
+                (key, node)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(key, node)| Hit {
+                id: self.ids[node as usize],
+                score: if hib { -key } else { key },
+            })
+            .collect()
+    }
+}
+
+#[inline]
+fn read_u32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+#[inline]
+fn read_u64(b: &[u8], o: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[o..o + 8]);
+    u64::from_le_bytes(a)
+}
+#[inline]
+fn read_f32(b: &[u8], o: usize) -> f32 {
+    f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
 fn put_f32s(b: &mut [u8], off: usize, data: &[f32]) {
@@ -620,6 +822,27 @@ mod tests {
             let q = &items[t * 29 % items.len()].1;
             let a: Vec<u64> = idx.search(q, 10, 64).iter().map(|h| h.id).collect();
             let b: Vec<u64> = loaded.search(q, 10, 64).iter().map(|h| h.id).collect();
+            assert_eq!(a, b);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn diskann_mmap_matches_in_memory() {
+        let dim = 48;
+        let items = clustered(1200, dim, 20);
+        let idx = DiskAnnIndex::build(&items, Metric::L2, 24, 64, 1.2, 12, 128);
+        let mut path = std::env::temp_dir();
+        path.push("vecdb_diskann_mmap.vecdb");
+        idx.save(&path).unwrap();
+        // Disk-resident view: graph + raw stay in the map, PQ codes in RAM.
+        let m = DiskAnnIndex::open(&path).unwrap();
+        assert_eq!(m.len(), idx.len());
+        assert_eq!(m.dim(), idx.dim());
+        for t in 0..15 {
+            let q = &items[t * 29 % items.len()].1;
+            let a: Vec<u64> = idx.search(q, 10, 64).iter().map(|h| h.id).collect();
+            let b: Vec<u64> = m.search(q, 10, 64).iter().map(|h| h.id).collect();
             assert_eq!(a, b);
         }
         std::fs::remove_file(&path).ok();

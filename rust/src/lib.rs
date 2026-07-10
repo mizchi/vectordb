@@ -32,7 +32,7 @@ pub mod rabitq;
 pub mod storage;
 
 pub use bin_quant::BinaryIndex;
-pub use diskann::DiskAnnIndex;
+pub use diskann::{DiskAnnIndex, MmapDiskAnn};
 pub use hnsw::HnswIndex;
 pub use hnsw_q::HnswQIndex;
 pub use index::{FlatIndex, Hit, Metric, View};

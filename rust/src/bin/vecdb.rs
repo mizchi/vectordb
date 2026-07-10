@@ -367,7 +367,8 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
             qvs.iter().map(|v| idx.search(v, k, over)).collect()
         }
         Kind::DiskAnn => {
-            let idx = DiskAnnIndex::load(index_path).map_err(|e| e.to_string())?;
+            // Disk-resident: graph + raw stay mmap'd, only PQ codes are in RAM.
+            let idx = DiskAnnIndex::open(index_path).map_err(|e| e.to_string())?;
             check_dims(&qvs, idx.dim())?;
             qvs.iter().map(|v| idx.search(v, k, ef)).collect()
         }

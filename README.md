@@ -264,11 +264,18 @@ use vectordb::{DiskAnnIndex, Metric};
 let idx = DiskAnnIndex::build(&items, Metric::L2, 32, 96, 1.2, 16, 256);
 let hits = idx.search(&query, 10, /*l_search=*/64);
 idx.save("index.diskann.vecdb")?;              // magic VECDBDA1
+
+// ディスク常駐モード: グラフ隣接と生 f32 は mmap のまま（ホップ毎/rerank 時に遅延読み）、
+// RAM には PQ コード＋コードブックだけ（≈ count*m バイト、次元に依らない）。
+let disk = DiskAnnIndex::open("index.diskann.vecdb")?;   // -> MmapDiskAnn
+let hits = disk.search(&query, 10, 64);
 ```
 
-最小版として **in-memory 構築 + owned/reload ストレージ**。DiskANN 本来の価値は「RAM に載らない
-十億件を SSD で」だが、その構成要素（PQ 常駐・rerank・グラフ探索・mmap）は本 crate に揃っている。
-SIFT10K では L=64 で recall 0.999（HNSW が同規模では速い＝DiskANN は大規模向け、という素直な結果）。
+構築は in-memory、探索は **`open()` で mmap 常駐**（グラフ＋生ベクトルはマップから読み、PQ だけ RAM）。
+これで DiskANN 本来の「SSD にグラフ＋生・RAM に圧縮コード」構成になる（RAM フットプリントは
+次元非依存の `count*m` バイト）。SIFT10K では L=64 で recall 0.999（in-memory 10k では HNSW が
+速い＝DiskANN の真価は RAM に載らない大規模を SSD で捌く領域、という素直な結果）。CLI の
+`search` も DiskANN は自動で mmap 経路を使う。
 
 構成:
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32要素/反復）
