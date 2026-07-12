@@ -59,6 +59,30 @@ g.save("kb.graphdb")?;
 let g = graphdb::GraphStore::load("kb.graphdb")?;
 ```
 
+### インクリメンタル更新（`GraphIndex`）
+
+ノートの追加・編集・削除で**全再構築せず**、該当ノードのエッジだけ更新する live グラフ
+（FreshDiskANN 相当）。編集は「そのノートだけ再埋め込み」して `insert`(upsert) するだけ。
+意味エッジは相互（reciprocal）に張るので、`related` は両方向から新/編集ノートを反映する。
+
+```rust
+use graphdb::{GraphIndex, NodeMeta};
+use vectordb::Metric;
+
+let mut gi = GraphIndex::new(Metric::Cosine, 8);
+gi.min_weight = 0.5;                       // 弱い（遠い）エッジは張らない
+gi.insert(id, &embedding, NodeMeta { title, tags });  // 追加 / 上書き(=編集)
+gi.link(a, b);                             // 明示リンク
+gi.remove(old_id);                         // 削除（全エッジから除去）
+let g = gi.freeze();                       // 問い合わせ/保存用の GraphStore へ
+g.save("kb.graphdb")?;
+```
+
+注意: エッジは各ノードの**挿入時点の kNN** を反映するため、バッチ `GraphBuilder` と違い、
+クラスタが揃う前に入ったノードは弱い遠エッジを拾い得る。`min_weight` を設定すればそれを防げる
+（ナレッジベースでは低類似度の「関連」は不要なので実運用でも推奨）。デモ:
+`cargo run -p graphdb --example live_update`。
+
 ## CLI
 
 ```bash
@@ -93,9 +117,10 @@ $G export       kb.graphdb --communities > graph.json
 - 実装済み: 意味 kNN 構築 / mutual-kNN・閾値枝刈り / 明示リンク統合 / related（タグフィルタ可）/
   neighborhood（タグフィルタ可）/ **ノードメタデータ（title + tags, 永続化）** / タグ検索
   （nodes_with_tag / by-tag / tag_counts）/ JSON エクスポート（label+tags+community）/
-  degree・label-propagation コミュニティ / `.graphdb` 永続化 / CLI。
-- 今後: インクリメンタル upsert（編集ノートの再埋め込み＋該当エッジのみ更新）、タグ間の
-  共起グラフ、PageRank、mmap ゼロコピー読み、大規模時の `search_batch` 並列構築。
+  degree・label-propagation コミュニティ / `.graphdb` 永続化 / CLI /
+  **インクリメンタル更新（`GraphIndex`: upsert / edit / remove → freeze）**。
+- 今後: タグ間の共起グラフ、PageRank、mmap ゼロコピー読み、大規模時の `search_batch` 並列構築、
+  live グラフの永続化（現状 `GraphIndex` は再構築でロード）。
 
 ## ライセンス
 
