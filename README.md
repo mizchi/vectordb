@@ -12,6 +12,10 @@
 > このページは**使い方ガイド**。アルゴリズム・設計の経緯・ファイル形式の詳細は
 > [`DESIGN.md`](./DESIGN.md) を参照。
 
+> **関連クレート**: [`graphdb`](./graphdb) — vectordb の上に載る意味的ナレッジグラフ
+> （kNN + 明示リンクの重み付きグラフ、関連記事・Obsidian 風グラフビュー向け）。
+> リポジトリは Cargo workspace（`rust` = vectordb, `graphdb`）。
+
 ---
 
 ## 目次

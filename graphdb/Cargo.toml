@@ -1,0 +1,21 @@
+[package]
+name = "graphdb"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic knowledge graph over vectordb: kNN + explicit links, weighted, mmap single-file"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vectordb = { path = "../rust" }
+
+[features]
+default = ["parallel"]
+parallel = ["vectordb/parallel"]
+
+[[bin]]
+name = "graphdb"
+path = "src/bin/graphdb.rs"
+
+[[example]]
+name = "graph_view"
+path = "examples/graph_view.rs"

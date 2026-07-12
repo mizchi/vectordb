@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["rust", "graphdb"]
+
+# Profiles must live in the workspace root (member-level profiles are ignored).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
