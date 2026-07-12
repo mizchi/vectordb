@@ -1,7 +1,8 @@
 //! Weighted graph store with a single-file `.graphdb` format.
 //!
 //! Nodes are external `u64` ids (e.g. note ids); edges are directed and carry a
-//! `weight` (semantic similarity or a link constant) and a [`EdgeKind`]. The
+//! `weight` (semantic similarity or a link constant) and a [`EdgeKind`]. Nodes
+//! also carry optional metadata: a `title` and a set of `tags` (interned). The
 //! adjacency is stored CSR-style and each node's out-edges are kept sorted by
 //! descending weight, so `related` is just a prefix. Persistence mirrors the
 //! `vectordb` `.vecdb` discipline: an 8-byte magic, a 64-byte header, 16-byte
@@ -48,6 +49,13 @@ impl EdgeKind {
     }
 }
 
+/// Per-node metadata attached to the graph.
+#[derive(Clone, Debug, Default)]
+pub struct NodeMeta {
+    pub title: String,
+    pub tags: Vec<String>,
+}
+
 /// One out-edge as seen by queries.
 #[derive(Clone, Copy, Debug)]
 pub struct Neighbor {
@@ -63,7 +71,8 @@ pub struct Subgraph {
     pub edges: Vec<(u64, u64, f32, EdgeKind)>,
 }
 
-/// A weighted directed graph over `u64` node ids, CSR-backed.
+/// A weighted directed graph over `u64` node ids, CSR-backed, with optional
+/// per-node metadata (title + interned tags).
 pub struct GraphStore {
     metric: Metric,
     directed: bool,
@@ -73,11 +82,17 @@ pub struct GraphStore {
     weight: Vec<f32>,
     kind: Vec<u8>,
     idx: HashMap<u64, u32>, // external id -> node index
+    // metadata (len n; empty title / no tags allowed)
+    titles: Vec<String>,
+    node_tags: Vec<Vec<u32>>,      // per node, interned tag ids
+    tag_names: Vec<String>,        // tag id -> name
+    tag_ids: HashMap<String, u32>, // name -> tag id
+    tag_members: Vec<Vec<u32>>,    // tag id -> node indices (built with tags)
 }
 
 impl GraphStore {
-    /// Assemble from a CSR triple. Each node's slice should already be sorted by
-    /// descending weight. `ids[i]` is node `i`'s external id.
+    /// Assemble from a CSR triple (metadata empty). Each node's slice should be
+    /// sorted by descending weight; `ids[i]` is node `i`'s external id.
     pub(crate) fn from_csr(
         metric: Metric,
         directed: bool,
@@ -87,6 +102,7 @@ impl GraphStore {
         weight: Vec<f32>,
         kind: Vec<u8>,
     ) -> GraphStore {
+        let n = ids.len();
         let idx = ids
             .iter()
             .enumerate()
@@ -101,7 +117,54 @@ impl GraphStore {
             weight,
             kind,
             idx,
+            titles: vec![String::new(); n],
+            node_tags: vec![Vec::new(); n],
+            tag_names: Vec::new(),
+            tag_ids: HashMap::new(),
+            tag_members: Vec::new(),
         }
+    }
+
+    /// Attach per-node metadata (title + tags), keyed by external id. Tags are
+    /// interned; unknown ids are ignored. Replaces any existing metadata.
+    pub fn set_metadata(&mut self, meta: impl IntoIterator<Item = (u64, NodeMeta)>) {
+        let n = self.ids.len();
+        self.titles = vec![String::new(); n];
+        self.node_tags = vec![Vec::new(); n];
+        self.tag_names.clear();
+        self.tag_ids.clear();
+        for (id, m) in meta {
+            let Some(&node) = self.idx.get(&id) else {
+                continue;
+            };
+            let node = node as usize;
+            self.titles[node] = m.title;
+            let mut tids: Vec<u32> = m.tags.iter().map(|t| self.intern_tag(t)).collect();
+            tids.sort_unstable();
+            tids.dedup();
+            self.node_tags[node] = tids;
+        }
+        self.rebuild_tag_members();
+    }
+
+    fn intern_tag(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.tag_ids.get(name) {
+            return id;
+        }
+        let id = self.tag_names.len() as u32;
+        self.tag_names.push(name.to_string());
+        self.tag_ids.insert(name.to_string(), id);
+        id
+    }
+
+    fn rebuild_tag_members(&mut self) {
+        let mut members = vec![Vec::new(); self.tag_names.len()];
+        for (node, tags) in self.node_tags.iter().enumerate() {
+            for &t in tags {
+                members[t as usize].push(node as u32);
+            }
+        }
+        self.tag_members = members;
     }
 
     pub fn len(&self) -> usize {
@@ -123,6 +186,10 @@ impl GraphStore {
     pub fn ids(&self) -> &[u64] {
         &self.ids
     }
+    /// Distinct tag names in the graph.
+    pub fn tag_names(&self) -> &[String] {
+        &self.tag_names
+    }
 
     fn node_of(&self, id: u64) -> Option<u32> {
         self.idx.get(&id).copied()
@@ -131,6 +198,55 @@ impl GraphStore {
     fn range(&self, node: u32) -> std::ops::Range<usize> {
         let n = node as usize;
         self.offsets[n]..self.offsets[n + 1]
+    }
+
+    /// Title of `id` (None if unset/empty or unknown).
+    pub fn title(&self, id: u64) -> Option<&str> {
+        let n = self.node_of(id)? as usize;
+        let t = self.titles[n].as_str();
+        (!t.is_empty()).then_some(t)
+    }
+
+    /// Tags of `id` (empty if none/unknown).
+    pub fn tags(&self, id: u64) -> Vec<&str> {
+        let Some(n) = self.node_of(id) else {
+            return Vec::new();
+        };
+        self.node_tags[n as usize]
+            .iter()
+            .map(|&t| self.tag_names[t as usize].as_str())
+            .collect()
+    }
+
+    /// True if `id` carries `tag`.
+    pub fn has_tag(&self, id: u64, tag: &str) -> bool {
+        let (Some(n), Some(&t)) = (self.node_of(id), self.tag_ids.get(tag)) else {
+            return false;
+        };
+        self.node_tags[n as usize].contains(&t)
+    }
+
+    /// External ids of every node carrying `tag`.
+    pub fn nodes_with_tag(&self, tag: &str) -> Vec<u64> {
+        match self.tag_ids.get(tag) {
+            Some(&t) => self.tag_members[t as usize]
+                .iter()
+                .map(|&n| self.ids[n as usize])
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// (tag, count) for every tag, most frequent first.
+    pub fn tag_counts(&self) -> Vec<(&str, usize)> {
+        let mut v: Vec<(&str, usize)> = self
+            .tag_names
+            .iter()
+            .enumerate()
+            .map(|(t, name)| (name.as_str(), self.tag_members[t].len()))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v
     }
 
     /// Out-degree of `id` (0 if unknown).
@@ -159,28 +275,47 @@ impl GraphStore {
         v
     }
 
+    /// Top-`k` related nodes whose id satisfies `keep` (e.g. a tag filter).
+    pub fn related_filter(&self, id: u64, k: usize, keep: impl Fn(u64) -> bool) -> Vec<Neighbor> {
+        self.neighbors(id)
+            .into_iter()
+            .filter(|n| keep(n.id))
+            .take(k)
+            .collect()
+    }
+
     /// Extract the neighborhood around `id`: a best-first (highest-weight)
-    /// expansion up to `depth` hops, capped at `max_nodes` nodes. This is the
+    /// expansion up to `depth` hops, capped at `max_nodes` nodes, keeping only
+    /// nodes for which `keep` holds (use `|_| true` for no filter). This is the
     /// data an Obsidian-style *local* graph view needs.
-    pub fn neighborhood(&self, id: u64, depth: usize, max_nodes: usize) -> Subgraph {
+    pub fn neighborhood(
+        &self,
+        id: u64,
+        depth: usize,
+        max_nodes: usize,
+        keep: impl Fn(u64) -> bool,
+    ) -> Subgraph {
         let mut sub = Subgraph::default();
         let Some(start) = self.node_of(id) else {
             return sub;
         };
+        if !keep(id) {
+            return sub;
+        }
         let mut seen: HashMap<u32, ()> = HashMap::new();
         seen.insert(start, ());
         sub.nodes.push(id);
-        // frontier: (node, hops-remaining), expanded best-first within each ring.
         let mut frontier = vec![(start, depth)];
         while let Some((node, hops)) = frontier.pop() {
             if hops == 0 {
                 continue;
             }
-            // neighbors are pre-sorted by weight; expand strongest first.
             for e in self.range(node) {
                 let dnode = self.dst[e];
                 let did = self.ids[dnode as usize];
-                // Record the edge if the destination is (or becomes) in-view.
+                if !keep(did) {
+                    continue;
+                }
                 let newly = !seen.contains_key(&dnode);
                 if newly && sub.nodes.len() >= max_nodes {
                     continue;
@@ -202,13 +337,9 @@ impl GraphStore {
     }
 
     /// Export the whole graph as JSON (`{nodes:[...], edges:[...]}`) for a graph
-    /// view. `labels` optionally names nodes; `communities` (per node index)
-    /// optionally colors them; node `size` is the out-degree.
-    pub fn export_json(
-        &self,
-        labels: Option<&HashMap<u64, String>>,
-        communities: Option<&[u32]>,
-    ) -> String {
+    /// view. Each node carries `degree` (size), any `label`/`tags`, and — if
+    /// `communities` (per node index) is given — a `community` (color).
+    pub fn export_json(&self, communities: Option<&[u32]>) -> String {
         let mut s = String::from("{\"nodes\":[");
         for (i, &id) in self.ids.iter().enumerate() {
             if i > 0 {
@@ -216,10 +347,18 @@ impl GraphStore {
             }
             let deg = self.range(i as u32).len();
             s.push_str(&format!("{{\"id\":{id},\"degree\":{deg}"));
-            if let Some(m) = labels {
-                if let Some(name) = m.get(&id) {
-                    s.push_str(&format!(",\"label\":{}", json_str(name)));
+            if !self.titles[i].is_empty() {
+                s.push_str(&format!(",\"label\":{}", json_str(&self.titles[i])));
+            }
+            if !self.node_tags[i].is_empty() {
+                s.push_str(",\"tags\":[");
+                for (j, &t) in self.node_tags[i].iter().enumerate() {
+                    if j > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&json_str(&self.tag_names[t as usize]));
                 }
+                s.push(']');
             }
             if let Some(c) = communities {
                 s.push_str(&format!(",\"community\":{}", c[i]));
@@ -251,12 +390,45 @@ impl GraphStore {
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.ids.len();
         let edges = self.dst.len();
-        let ids_off = align16(HEADER_LEN);
-        let off_off = align16(ids_off + n * 8);
-        let dst_off = align16(off_off + (n + 1) * 8);
-        let w_off = align16(dst_off + edges * 4);
-        let kind_off = align16(w_off + edges * 4);
-        let total = align16(kind_off + edges);
+        let tag_count = self.tag_names.len();
+
+        // Flatten metadata.
+        let mut label_blob = Vec::new();
+        let mut label_off = Vec::with_capacity(n + 1);
+        label_off.push(0u64);
+        for t in &self.titles {
+            label_blob.extend_from_slice(t.as_bytes());
+            label_off.push(label_blob.len() as u64);
+        }
+        let mut tag_ids: Vec<u32> = Vec::new();
+        let mut tag_off = Vec::with_capacity(n + 1);
+        tag_off.push(0u64);
+        for tags in &self.node_tags {
+            tag_ids.extend_from_slice(tags);
+            tag_off.push(tag_ids.len() as u64);
+        }
+        let mut tn_blob = Vec::new();
+        let mut tn_off = Vec::with_capacity(tag_count + 1);
+        tn_off.push(0u64);
+        for name in &self.tag_names {
+            tn_blob.extend_from_slice(name.as_bytes());
+            tn_off.push(tn_blob.len() as u64);
+        }
+
+        // Section offsets.
+        let mut pos = HEADER_LEN;
+        let ids_off = sec(&mut pos, n * 8);
+        let off_off = sec(&mut pos, (n + 1) * 8);
+        let dst_off = sec(&mut pos, edges * 4);
+        let w_off = sec(&mut pos, edges * 4);
+        let kind_off = sec(&mut pos, edges);
+        let loff_off = sec(&mut pos, (n + 1) * 8);
+        let lblob_off = sec(&mut pos, label_blob.len());
+        let toff_off = sec(&mut pos, (n + 1) * 8);
+        let tids_off = sec(&mut pos, tag_ids.len() * 4);
+        let tnoff_off = sec(&mut pos, (tag_count + 1) * 8);
+        let tnblob_off = sec(&mut pos, tn_blob.len());
+        let total = align16(pos);
 
         let mut b = vec![0u8; total];
         b[0..8].copy_from_slice(MAGIC);
@@ -265,6 +437,7 @@ impl GraphStore {
         b[16..20].copy_from_slice(&(n as u32).to_le_bytes());
         b[20..24].copy_from_slice(&(edges as u32).to_le_bytes());
         b[24] = self.directed as u8;
+        b[28..32].copy_from_slice(&(tag_count as u32).to_le_bytes());
 
         for (i, &id) in self.ids.iter().enumerate() {
             put_u64(&mut b, ids_off + i * 8, id);
@@ -279,6 +452,20 @@ impl GraphStore {
             b[w_off + i * 4..w_off + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
         b[kind_off..kind_off + edges].copy_from_slice(&self.kind);
+        for (i, &o) in label_off.iter().enumerate() {
+            put_u64(&mut b, loff_off + i * 8, o);
+        }
+        b[lblob_off..lblob_off + label_blob.len()].copy_from_slice(&label_blob);
+        for (i, &o) in tag_off.iter().enumerate() {
+            put_u64(&mut b, toff_off + i * 8, o);
+        }
+        for (i, &t) in tag_ids.iter().enumerate() {
+            put_u32(&mut b, tids_off + i * 4, t);
+        }
+        for (i, &o) in tn_off.iter().enumerate() {
+            put_u64(&mut b, tnoff_off + i * 8, o);
+        }
+        b[tnblob_off..tnblob_off + tn_blob.len()].copy_from_slice(&tn_blob);
         b
     }
 
@@ -294,14 +481,34 @@ impl GraphStore {
         let n = read_u32(b, 16) as usize;
         let edges = read_u32(b, 20) as usize;
         let directed = b[24] != 0;
+        let tag_count = read_u32(b, 28) as usize;
 
-        let ids_off = align16(HEADER_LEN);
-        let off_off = align16(ids_off + n * 8);
-        let dst_off = align16(off_off + (n + 1) * 8);
-        let w_off = align16(dst_off + edges * 4);
-        let kind_off = align16(w_off + edges * 4);
-        let total = align16(kind_off + edges);
-        if b.len() < total {
+        // Walk sections (reading each offset array to size the following blob).
+        let mut pos = HEADER_LEN;
+        let ids_off = adv(&mut pos, n * 8);
+        let off_off = adv(&mut pos, (n + 1) * 8);
+        let dst_off = adv(&mut pos, edges * 4);
+        let w_off = adv(&mut pos, edges * 4);
+        let kind_off = adv(&mut pos, edges);
+        let loff_off = adv(&mut pos, (n + 1) * 8);
+        if b.len() < loff_off + (n + 1) * 8 {
+            return Err(bad("truncated (labels)"));
+        }
+        let label_blob_len = read_u64(b, loff_off + n * 8) as usize;
+        let lblob_off = adv(&mut pos, label_blob_len);
+        let toff_off = adv(&mut pos, (n + 1) * 8);
+        if b.len() < toff_off + (n + 1) * 8 {
+            return Err(bad("truncated (tags)"));
+        }
+        let total_tag_ids = read_u64(b, toff_off + n * 8) as usize;
+        let tids_off = adv(&mut pos, total_tag_ids * 4);
+        let tnoff_off = adv(&mut pos, (tag_count + 1) * 8);
+        if b.len() < tnoff_off + (tag_count + 1) * 8 {
+            return Err(bad("truncated (tag names)"));
+        }
+        let tn_blob_len = read_u64(b, tnoff_off + tag_count * 8) as usize;
+        let tnblob_off = adv(&mut pos, tn_blob_len);
+        if b.len() < align16(pos) {
             return Err(bad("file truncated"));
         }
 
@@ -315,9 +522,40 @@ impl GraphStore {
         let dst: Vec<u32> = (0..edges).map(|i| read_u32(b, dst_off + i * 4)).collect();
         let weight: Vec<f32> = (0..edges).map(|i| read_f32(b, w_off + i * 4)).collect();
         let kind: Vec<u8> = b[kind_off..kind_off + edges].to_vec();
-        Ok(GraphStore::from_csr(
-            metric, directed, ids, offsets, dst, weight, kind,
-        ))
+
+        let mut g = GraphStore::from_csr(metric, directed, ids, offsets, dst, weight, kind);
+
+        // Tag names.
+        g.tag_names = (0..tag_count)
+            .map(|t| {
+                let s = read_u64(b, tnoff_off + t * 8) as usize;
+                let e = read_u64(b, tnoff_off + (t + 1) * 8) as usize;
+                String::from_utf8_lossy(&b[tnblob_off + s..tnblob_off + e]).into_owned()
+            })
+            .collect();
+        g.tag_ids = g
+            .tag_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i as u32))
+            .collect();
+        // Titles + node tags.
+        g.titles = (0..n)
+            .map(|i| {
+                let s = read_u64(b, loff_off + i * 8) as usize;
+                let e = read_u64(b, loff_off + (i + 1) * 8) as usize;
+                String::from_utf8_lossy(&b[lblob_off + s..lblob_off + e]).into_owned()
+            })
+            .collect();
+        g.node_tags = (0..n)
+            .map(|i| {
+                let s = read_u64(b, toff_off + i * 8) as usize;
+                let e = read_u64(b, toff_off + (i + 1) * 8) as usize;
+                (s..e).map(|j| read_u32(b, tids_off + j * 4)).collect()
+            })
+            .collect();
+        g.rebuild_tag_members();
+        Ok(g)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -329,12 +567,24 @@ impl GraphStore {
 }
 
 const MAGIC: &[u8; 8] = b"GRAPHDB1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: usize = 64;
 
 #[inline]
 fn align16(x: usize) -> usize {
     (x + 15) & !15
+}
+/// Reserve a 16-aligned section of `len` bytes, returning its start.
+#[inline]
+fn sec(pos: &mut usize, len: usize) -> usize {
+    let start = align16(*pos);
+    *pos = start + len;
+    start
+}
+/// Same as [`sec`] but for the read path (identical arithmetic).
+#[inline]
+fn adv(pos: &mut usize, len: usize) -> usize {
+    sec(pos, len)
 }
 #[inline]
 fn put_u32(b: &mut [u8], o: usize, v: u32) {

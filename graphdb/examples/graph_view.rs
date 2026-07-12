@@ -35,18 +35,38 @@ fn main() {
 
     let mut b = GraphBuilder::new(Metric::Cosine, 4);
     b.mutual = true; // cleaner global view
-    let g = b.build(&items, &links);
+    let mut g = b.build(&items, &links);
+
+    // Attach metadata: a title and a per-cluster tag on every note.
+    g.set_metadata(items.iter().map(|(id, _)| {
+        let topic = ["rust", "graph", "search", "wasm", "misc"][*id as usize % clusters];
+        (
+            *id,
+            graphdb::NodeMeta {
+                title: format!("note {id}"),
+                tags: vec![topic.to_string()],
+            },
+        )
+    }));
 
     println!("nodes={} edges={}", g.len(), g.edge_count());
     let comms = analytics::communities_label_propagation(&g, 20);
     let ncomm = comms.iter().copied().max().map(|m| m + 1).unwrap_or(0);
     println!("communities={ncomm}");
+    println!("tags: {:?}", g.tag_counts());
 
     println!("\nrelated to note 0 (same cluster = 0,5,10,15,20,25):");
     for nb in g.related(0, 5) {
-        println!("  {} w={:.3} ({})", nb.id, nb.weight, nb.kind.label());
+        let t = g.tags(nb.id).join(",");
+        println!("  {} w={:.3} ({}) [{t}]", nb.id, nb.weight, nb.kind.label());
+    }
+
+    println!("\nrelated to note 0, restricted to tag \"rust\":");
+    let rust: std::collections::HashSet<u64> = g.nodes_with_tag("rust").into_iter().collect();
+    for nb in g.related_filter(0, 5, |id| rust.contains(&id)) {
+        println!("  {} w={:.3}", nb.id, nb.weight);
     }
 
     println!("\ngraph-view JSON:");
-    println!("{}", g.export_json(None, Some(&comms)));
+    println!("{}", g.export_json(Some(&comms)));
 }

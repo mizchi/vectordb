@@ -32,7 +32,7 @@ pub mod build;
 pub mod graph;
 
 pub use build::GraphBuilder;
-pub use graph::{EdgeKind, GraphStore, Neighbor, Subgraph};
+pub use graph::{EdgeKind, GraphStore, Neighbor, NodeMeta, Subgraph};
 
 #[cfg(test)]
 mod tests {
@@ -103,7 +103,7 @@ mod tests {
     fn neighborhood_and_communities() {
         let items = clustered();
         let g = GraphBuilder::new(Metric::Cosine, 3).build(&items, &[]);
-        let sub = g.neighborhood(0, 2, 10);
+        let sub = g.neighborhood(0, 2, 10, |_| true);
         assert!(sub.nodes.contains(&0));
         assert!(sub.nodes.len() >= 2);
 
@@ -112,8 +112,48 @@ mod tests {
         // The two clusters should land in different communities.
         assert_ne!(comms[0], comms[7]);
 
-        let json = g.export_json(None, Some(&comms));
+        let json = g.export_json(Some(&comms));
         assert!(json.starts_with("{\"nodes\":["));
         assert!(json.contains("\"community\":"));
+    }
+
+    #[test]
+    fn tags_and_metadata() {
+        let items = clustered();
+        let mut g = GraphBuilder::new(Metric::Cosine, 3).build(&items, &[]);
+        // Cluster A -> tag "a", cluster B -> tag "b"; a couple share "shared".
+        let meta = (0..8u64).map(|id| {
+            let mut tags = vec![if id < 4 { "a" } else { "b" }.to_string()];
+            if id % 4 == 0 {
+                tags.push("shared".into());
+            }
+            (
+                id,
+                NodeMeta {
+                    title: format!("note {id}"),
+                    tags,
+                },
+            )
+        });
+        g.set_metadata(meta);
+
+        assert_eq!(g.title(3), Some("note 3"));
+        assert!(g.has_tag(0, "a") && g.has_tag(0, "shared"));
+        assert_eq!(g.nodes_with_tag("shared").len(), 2); // ids 0 and 4
+        assert_eq!(g.nodes_with_tag("a").len(), 4);
+        assert!(g.tag_counts().iter().any(|(t, c)| *t == "a" && *c == 4));
+
+        // related restricted to tag "a" never leaves cluster A.
+        let allow: std::collections::HashSet<u64> = g.nodes_with_tag("a").into_iter().collect();
+        for nb in g.related_filter(1, 5, |id| allow.contains(&id)) {
+            assert!(nb.id < 4);
+        }
+
+        // Metadata survives a byte round-trip; export carries tags.
+        let g2 = GraphStore::from_bytes(&g.to_bytes()).unwrap();
+        assert_eq!(g2.title(3), Some("note 3"));
+        assert_eq!(g2.tags(0).len(), 2);
+        assert_eq!(g2.nodes_with_tag("b").len(), 4);
+        assert!(g2.export_json(None).contains("\"tags\":[\"a\",\"shared\"]"));
     }
 }
