@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>graphdb · constellation</title>
+<style>
+  :root {
+    /* neutrals biased toward the graph's cool ink */
+    --bg: #f6f7fb;
+    --bg-2: #eceff6;
+    --panel: rgba(255,255,255,0.82);
+    --stroke: #d4d9e6;
+    --ink: #191c26;
+    --ink-2: #5a6072;
+    --ink-3: #878da0;
+    --accent: #159e90;
+    --edge: 22,26,40;          /* rgb for semantic edges (alpha applied) */
+    --shadow: 0 10px 30px rgba(20,26,45,0.12);
+    /* categorical community palette (readable on both grounds) */
+    --c0:#c9832f; --c1:#7b6ae4; --c2:#d0517c; --c3:#3f9e58;
+    --c4:#2f86cf; --c5:#cf6a37; --c6:#a862c4; --c7:#2f9e8c;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0d1016; --bg-2:#12161f; --panel:rgba(20,25,35,0.80);
+      --stroke:#262c3a; --ink:#e7eaf3; --ink-2:#9aa2b6; --ink-3:#6b7288;
+      --accent:#31c8b8; --edge:210,216,235;
+      --shadow:0 12px 34px rgba(0,0,0,0.5);
+      --c0:#e0a53c; --c1:#9a8cf2; --c2:#e77399; --c3:#6fbf74;
+      --c4:#56a9e8; --c5:#e0824f; --c6:#c98bd6; --c7:#4bb8a6;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0d1016; --bg-2:#12161f; --panel:rgba(20,25,35,0.80);
+    --stroke:#262c3a; --ink:#e7eaf3; --ink-2:#9aa2b6; --ink-3:#6b7288;
+    --accent:#31c8b8; --edge:210,216,235; --shadow:0 12px 34px rgba(0,0,0,0.5);
+    --c0:#e0a53c; --c1:#9a8cf2; --c2:#e77399; --c3:#6fbf74;
+    --c4:#56a9e8; --c5:#e0824f; --c6:#c98bd6; --c7:#4bb8a6;
+  }
+  :root[data-theme="light"] {
+    --bg:#f6f7fb; --bg-2:#eceff6; --panel:rgba(255,255,255,0.82);
+    --stroke:#d4d9e6; --ink:#191c26; --ink-2:#5a6072; --ink-3:#878da0;
+    --accent:#159e90; --edge:22,26,40; --shadow:0 10px 30px rgba(20,26,45,0.12);
+    --c0:#c9832f; --c1:#7b6ae4; --c2:#d0517c; --c3:#3f9e58;
+    --c4:#2f86cf; --c5:#cf6a37; --c6:#a862c4; --c7:#2f9e8c;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+
+  #graph { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+  /* brand plate, top-left */
+  #brand {
+    position: fixed; top: 18px; left: 20px; z-index: 3; pointer-events: none;
+    max-width: 46ch;
+  }
+  #brand .eyebrow {
+    font-family: ui-monospace, monospace; font-size: 11px; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 4px;
+  }
+  #brand h1 {
+    margin: 0; font-size: 22px; font-weight: 620; letter-spacing: -.01em;
+    text-wrap: balance;
+  }
+  #brand p { margin: 4px 0 0; color: var(--ink-2); font-size: 12.5px; max-width: 40ch; }
+
+  /* instrument rail */
+  #panel {
+    position: fixed; top: 0; right: 0; z-index: 4;
+    width: min(340px, 90vw); height: 100%;
+    display: flex; flex-direction: column;
+    background: var(--panel); backdrop-filter: blur(14px) saturate(1.2);
+    border-left: 1px solid var(--stroke);
+    transform: translateX(0); transition: transform .28s cubic-bezier(.4,0,.2,1);
+  }
+  #panel.hidden { transform: translateX(100%); }
+  .panel-scroll { overflow-y: auto; padding: 18px 18px 24px; display: flex; flex-direction: column; gap: 20px; }
+
+  .field { position: relative; }
+  .field input {
+    width: 100%; padding: 9px 12px; border-radius: 9px;
+    border: 1px solid var(--stroke); background: var(--bg-2); color: var(--ink);
+    font-size: 13px; outline: none;
+  }
+  .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+
+  .stats { display: flex; gap: 16px; }
+  .stat { display: flex; flex-direction: column; }
+  .stat b { font-family: ui-monospace, monospace; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 10.5px; text-transform: uppercase; letter-spacing: .12em; color: var(--ink-3); }
+
+  h2.sec {
+    margin: 0; font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600;
+  }
+  .group { display: flex; flex-direction: column; gap: 9px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    padding: 4px 9px; border-radius: 999px; border: 1px solid var(--stroke);
+    background: var(--bg-2); color: var(--ink-2); font-size: 12px; user-select: none;
+  }
+  .chip:hover { color: var(--ink); border-color: var(--ink-3); }
+  .chip.on { background: color-mix(in srgb, var(--accent) 18%, var(--bg-2)); border-color: var(--accent); color: var(--ink); }
+  .chip .n { font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink-3); }
+  .chip.on .n { color: var(--accent); }
+
+  .legend { display: flex; flex-direction: column; gap: 6px; }
+  .legrow { display: flex; align-items: center; gap: 9px; cursor: pointer; padding: 2px 4px; border-radius: 7px; }
+  .legrow:hover { background: var(--bg-2); }
+  .legrow.on { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+  .legrow span { font-size: 12.5px; color: var(--ink-2); }
+  .legrow .n { margin-left: auto; font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+  .kinds { display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--ink-2); }
+  .kindrow { display: flex; align-items: center; gap: 10px; }
+  .kindrow i { width: 26px; height: 0; border-top-width: 2px; border-top-style: solid; flex: none; }
+
+  /* selected note detail */
+  #detail { display: none; flex-direction: column; gap: 10px;
+    padding: 14px; border: 1px solid var(--stroke); border-radius: 12px; background: var(--bg-2); }
+  #detail.show { display: flex; }
+  #detail .title { font-size: 15px; font-weight: 620; line-height: 1.3; text-wrap: balance; }
+  #detail .meta { display: flex; gap: 12px; font-size: 11px; color: var(--ink-3); font-family: ui-monospace, monospace; }
+  #detail .rel { display: flex; flex-direction: column; gap: 7px; }
+  .relitem { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; cursor: pointer; padding: 5px 7px; border-radius: 8px; }
+  .relitem:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .relitem .rt { font-size: 12.5px; color: var(--ink); }
+  .relitem .rw { font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; align-self: center; }
+  .relbar { grid-column: 1 / -1; height: 3px; border-radius: 2px; background: var(--stroke); overflow: hidden; }
+  .relbar i { display: block; height: 100%; background: var(--accent); }
+
+  .btn {
+    appearance: none; cursor: pointer; font: inherit; font-size: 12.5px;
+    padding: 8px 12px; border-radius: 9px; border: 1px solid var(--stroke);
+    background: var(--bg-2); color: var(--ink); display:inline-flex; gap:8px; align-items:center;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* toggle + hints */
+  #toggle {
+    position: fixed; top: 16px; right: 16px; z-index: 6; display: none;
+    width: 40px; height: 40px; border-radius: 10px; border: 1px solid var(--stroke);
+    background: var(--panel); color: var(--ink); cursor: pointer; backdrop-filter: blur(10px);
+  }
+  #hint {
+    position: fixed; left: 20px; bottom: 16px; z-index: 3; pointer-events: none;
+    font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink-3);
+  }
+  #hint b { color: var(--ink-2); font-weight: 600; }
+
+  #tooltip {
+    position: fixed; z-index: 7; pointer-events: none; opacity: 0; transition: opacity .12s;
+    background: var(--ink); color: var(--bg); padding: 5px 9px; border-radius: 7px;
+    font-size: 12px; max-width: 30ch; box-shadow: var(--shadow); transform: translate(-50%, -140%);
+  }
+  #tooltip.show { opacity: 1; }
+
+  /* load-data sheet */
+  #sheet { position: fixed; inset: 0; z-index: 10; display: none; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg) 55%, transparent); backdrop-filter: blur(3px); padding: 20px; }
+  #sheet.show { display: flex; }
+  .card { background: var(--bg); border: 1px solid var(--stroke); border-radius: 16px; box-shadow: var(--shadow);
+    width: min(560px, 100%); padding: 22px; display: flex; flex-direction: column; gap: 14px; }
+  .card h3 { margin: 0; font-size: 16px; }
+  .card p { margin: 0; color: var(--ink-2); font-size: 13px; }
+  .card textarea { width: 100%; min-height: 150px; resize: vertical; border-radius: 10px; border: 1px solid var(--stroke);
+    background: var(--bg-2); color: var(--ink); padding: 10px 12px; font-family: ui-monospace, monospace; font-size: 12px; }
+  .card .err { color: var(--c2); font-size: 12.5px; min-height: 1.2em; }
+  .spread { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+
+  @media (max-width: 720px) {
+    #toggle { display: block; }
+    #panel { box-shadow: var(--shadow); }
+    #panel.hidden { transform: translateX(100%); }
+    #brand { max-width: min(60vw, 40ch); }
+  }
+  @media (prefers-reduced-motion: reduce) { #panel { transition: none; } }
+</style>
+</head>
+<body>
+  <canvas id="graph"></canvas>
+
+  <div id="brand">
+    <p class="eyebrow">graphdb · idea constellation</p>
+    <h1>Your notes as a semantic map</h1>
+    <p>Edges are embedding-similarity (thin) and explicit links (bright). Color = community, size = connections. Click a note for what it links to.</p>
+  </div>
+
+  <button id="toggle" aria-label="Toggle panel">☰</button>
+
+  <aside id="panel">
+    <div class="panel-scroll">
+      <div class="field">
+        <input id="search" type="search" placeholder="Search notes…" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="stats">
+        <div class="stat"><b id="s-nodes" class="mono">0</b><span>notes</span></div>
+        <div class="stat"><b id="s-edges" class="mono">0</b><span>edges</span></div>
+        <div class="stat"><b id="s-comm" class="mono">0</b><span>clusters</span></div>
+      </div>
+
+      <div id="detail">
+        <div class="title" id="d-title"></div>
+        <div class="meta"><span id="d-deg"></span><span id="d-comm"></span></div>
+        <div class="chips" id="d-tags"></div>
+        <h2 class="sec">Related notes</h2>
+        <div class="rel" id="d-rel"></div>
+      </div>
+
+      <div class="group">
+        <h2 class="sec">Tags</h2>
+        <div class="chips" id="tags"></div>
+      </div>
+
+      <div class="group">
+        <h2 class="sec">Communities</h2>
+        <div class="legend" id="communities"></div>
+      </div>
+
+      <div class="group">
+        <h2 class="sec">Edges</h2>
+        <div class="kinds">
+          <div class="kindrow"><i style="border-top-color: rgba(var(--edge),.55)"></i> semantic (kNN, thicker = closer)</div>
+          <div class="kindrow"><i style="border-top-color: var(--accent); border-top-width:2.5px"></i> explicit link</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button class="btn" id="open-load">Load your export…</button>
+        <button class="btn" id="reset-view">Reset view</button>
+      </div>
+    </div>
+  </aside>
+
+  <div id="hint"><b>drag</b> nodes · <b>scroll</b> zoom · <b>drag bg</b> pan · <b>click</b> select</div>
+  <div id="tooltip"></div>
+
+  <div id="sheet">
+    <div class="card">
+      <div class="spread"><h3>Load a graphdb export</h3></div>
+      <p>Paste the JSON from <span class="mono">graphdb export &lt;g.graphdb&gt; --communities</span>, or choose a file.</p>
+      <input type="file" id="file" accept="application/json,.json">
+      <textarea id="paste" placeholder='{"nodes":[…],"edges":[…]}'></textarea>
+      <div class="err" id="load-err"></div>
+      <div class="spread">
+        <button class="btn" id="load-sample">Restore sample</button>
+        <div class="row">
+          <button class="btn" id="cancel-load">Cancel</button>
+          <button class="btn primary" id="do-load">Load</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const SAMPLE = {"nodes":[{"id":0,"degree":7,"label":"Ownership and borrowing","tags":["rust","systems"],"community":0},{"id":1,"degree":6,"label":"Lifetimes in practice","tags":["rust","systems"],"community":0},{"id":2,"degree":6,"label":"Zero-cost abstractions","tags":["rust","systems"],"community":0},{"id":3,"degree":7,"label":"Trait objects vs generics","tags":["rust","systems"],"community":0},{"id":4,"degree":6,"label":"Unsafe Rust, carefully","tags":["rust"],"community":0},{"id":5,"degree":6,"label":"Error handling with Result","tags":["rust","systems"],"community":0},{"id":6,"degree":6,"label":"Cargo workspaces","tags":["rust","systems"],"community":0},{"id":7,"degree":6,"label":"Futures and executors","tags":["async"],"community":1},{"id":8,"degree":6,"label":"Pinning explained","tags":["rust","async"],"community":1},{"id":9,"degree":5,"label":"tokio task scheduling","tags":["async"],"community":1},{"id":10,"degree":5,"label":"async traits today","tags":["async"],"community":1},{"id":11,"degree":5,"label":"Cancellation and select!","tags":["rust","async"],"community":1},{"id":12,"degree":5,"label":"Backpressure with channels","tags":["async"],"community":1},{"id":13,"degree":4,"label":"Compiling Rust to wasm","tags":["wasm","web"],"community":2},{"id":14,"degree":4,"label":"wasm-bindgen basics","tags":["wasm"],"community":2},{"id":15,"degree":4,"label":"SIMD in WebAssembly","tags":["wasm"],"community":2},{"id":16,"degree":4,"label":"wasm component model","tags":["wasm","web"],"community":2},{"id":17,"degree":4,"label":"Running wasm on the edge","tags":["wasm","web"],"community":2},{"id":18,"degree":6,"label":"HNSW navigable graphs","tags":["graph","algorithms"],"community":3},{"id":19,"degree":5,"label":"Vamana / DiskANN","tags":["graph","algorithms"],"community":3},{"id":20,"degree":5,"label":"Label propagation","tags":["graph","algorithms"],"community":3},{"id":21,"degree":6,"label":"PageRank from scratch","tags":["graph","algorithms"],"community":3},{"id":22,"degree":5,"label":"Community detection","tags":["graph"],"community":3},{"id":23,"degree":5,"label":"Force-directed layout","tags":["graph"],"community":3},{"id":24,"degree":5,"label":"Product quantization","tags":["search"],"community":4},{"id":25,"degree":5,"label":"Inverted file (IVF)","tags":["algorithms","search"],"community":4},{"id":26,"degree":5,"label":"Reranking with exact distance","tags":["algorithms","search"],"community":4},{"id":27,"degree":6,"label":"Recall vs latency","tags":["search"],"community":4},{"id":28,"degree":5,"label":"Binary quantization","tags":["algorithms","search"],"community":4},{"id":29,"degree":5,"label":"RaBitQ estimator","tags":["search"],"community":4},{"id":30,"degree":4,"label":"Sentence embeddings","tags":["ml","python"],"community":5},{"id":31,"degree":4,"label":"Cosine vs dot product","tags":["ml","python"],"community":5},{"id":32,"degree":4,"label":"Contrastive learning","tags":["ml","python"],"community":5},{"id":33,"degree":4,"label":"Nearest-neighbor classifiers","tags":["ml"],"community":5},{"id":34,"degree":4,"label":"Dimensionality reduction","tags":["ml","python"],"community":5},{"id":35,"degree":4,"label":"Canvas rendering loop","tags":["web"],"community":6},{"id":36,"degree":4,"label":"requestAnimationFrame timing","tags":["web","frontend"],"community":6},{"id":37,"degree":4,"label":"CSS custom properties","tags":["web","frontend"],"community":6},{"id":38,"degree":4,"label":"Theme-aware color tokens","tags":["web"],"community":6},{"id":39,"degree":6,"label":"Accessible focus states","tags":["web"],"community":6},{"id":40,"degree":4,"label":"mmap single-file formats","tags":["db"],"community":7},{"id":41,"degree":4,"label":"CSR adjacency layout","tags":["db"],"community":7},{"id":42,"degree":4,"label":"Little-endian serialization","tags":["db"],"community":7},{"id":43,"degree":4,"label":"Tombstones and compaction","tags":["db"],"community":7},{"id":44,"degree":4,"label":"Zero-copy reads","tags":["systems","db"],"community":7}],"edges":[{"source":0,"target":7,"weight":1.0000,"kind":"link"},{"source":0,"target":4,"weight":0.9805,"kind":"semantic"},{"source":0,"target":3,"weight":0.9782,"kind":"semantic"},{"source":0,"target":6,"weight":0.9766,"kind":"semantic"},{"source":0,"target":1,"weight":0.9758,"kind":"semantic"},{"source":0,"target":5,"weight":0.9737,"kind":"semantic"},{"source":0,"target":2,"weight":0.9730,"kind":"semantic"},{"source":1,"target":3,"weight":0.9859,"kind":"semantic"},{"source":1,"target":4,"weight":0.9804,"kind":"semantic"},{"source":1,"target":6,"weight":0.9804,"kind":"semantic"},{"source":1,"target":0,"weight":0.9758,"kind":"semantic"},{"source":1,"target":5,"weight":0.9719,"kind":"semantic"},{"source":1,"target":2,"weight":0.9691,"kind":"semantic"},{"source":2,"target":0,"weight":0.9730,"kind":"semantic"},{"source":2,"target":5,"weight":0.9722,"kind":"semantic"},{"source":2,"target":4,"weight":0.9699,"kind":"semantic"},{"source":2,"target":3,"weight":0.9693,"kind":"semantic"},{"source":2,"target":1,"weight":0.9691,"kind":"semantic"},{"source":2,"target":6,"weight":0.9655,"kind":"semantic"},{"source":3,"target":20,"weight":1.0000,"kind":"link"},{"source":3,"target":1,"weight":0.9859,"kind":"semantic"},{"source":3,"target":4,"weight":0.9813,"kind":"semantic"},{"source":3,"target":0,"weight":0.9782,"kind":"semantic"},{"source":3,"target":6,"weight":0.9751,"kind":"semantic"},{"source":3,"target":5,"weight":0.9727,"kind":"semantic"},{"source":3,"target":2,"weight":0.9693,"kind":"semantic"},{"source":4,"target":3,"weight":0.9813,"kind":"semantic"},{"source":4,"target":0,"weight":0.9805,"kind":"semantic"},{"source":4,"target":1,"weight":0.9804,"kind":"semantic"},{"source":4,"target":6,"weight":0.9765,"kind":"semantic"},{"source":4,"target":5,"weight":0.9743,"kind":"semantic"},{"source":4,"target":2,"weight":0.9699,"kind":"semantic"},{"source":5,"target":4,"weight":0.9743,"kind":"semantic"},{"source":5,"target":0,"weight":0.9737,"kind":"semantic"},{"source":5,"target":3,"weight":0.9727,"kind":"semantic"},{"source":5,"target":2,"weight":0.9722,"kind":"semantic"},{"source":5,"target":1,"weight":0.9719,"kind":"semantic"},{"source":5,"target":6,"weight":0.9711,"kind":"semantic"},{"source":6,"target":1,"weight":0.9804,"kind":"semantic"},{"source":6,"target":0,"weight":0.9766,"kind":"semantic"},{"source":6,"target":4,"weight":0.9765,"kind":"semantic"},{"source":6,"target":3,"weight":0.9751,"kind":"semantic"},{"source":6,"target":5,"weight":0.9711,"kind":"semantic"},{"source":6,"target":2,"weight":0.9655,"kind":"semantic"},{"source":7,"target":12,"weight":0.9774,"kind":"semantic"},{"source":7,"target":8,"weight":0.9753,"kind":"semantic"},{"source":7,"target":10,"weight":0.9739,"kind":"semantic"},{"source":7,"target":9,"weight":0.9707,"kind":"semantic"},{"source":7,"target":11,"weight":0.9683,"kind":"semantic"},{"source":7,"target":39,"weight":0.2602,"kind":"semantic"},{"source":8,"target":12,"weight":0.9822,"kind":"semantic"},{"source":8,"target":9,"weight":0.9772,"kind":"semantic"},{"source":8,"target":11,"weight":0.9761,"kind":"semantic"},{"source":8,"target":7,"weight":0.9753,"kind":"semantic"},{"source":8,"target":10,"weight":0.9740,"kind":"semantic"},{"source":8,"target":39,"weight":0.2856,"kind":"semantic"},{"source":9,"target":12,"weight":0.9806,"kind":"semantic"},{"source":9,"target":10,"weight":0.9789,"kind":"semantic"},{"source":9,"target":8,"weight":0.9772,"kind":"semantic"},{"source":9,"target":11,"weight":0.9764,"kind":"semantic"},{"source":9,"target":7,"weight":0.9707,"kind":"semantic"},{"source":10,"target":12,"weight":0.9819,"kind":"semantic"},{"source":10,"target":9,"weight":0.9789,"kind":"semantic"},{"source":10,"target":11,"weight":0.9771,"kind":"semantic"},{"source":10,"target":8,"weight":0.9740,"kind":"semantic"},{"source":10,"target":7,"weight":0.9739,"kind":"semantic"},{"source":11,"target":10,"weight":0.9771,"kind":"semantic"},{"source":11,"target":9,"weight":0.9764,"kind":"semantic"},{"source":11,"target":8,"weight":0.9761,"kind":"semantic"},{"source":11,"target":12,"weight":0.9748,"kind":"semantic"},{"source":11,"target":7,"weight":0.9683,"kind":"semantic"},{"source":12,"target":8,"weight":0.9822,"kind":"semantic"},{"source":12,"target":10,"weight":0.9819,"kind":"semantic"},{"source":12,"target":9,"weight":0.9806,"kind":"semantic"},{"source":12,"target":7,"weight":0.9774,"kind":"semantic"},{"source":12,"target":11,"weight":0.9748,"kind":"semantic"},{"source":13,"target":14,"weight":0.9727,"kind":"semantic"},{"source":13,"target":17,"weight":0.9708,"kind":"semantic"},{"source":13,"target":15,"weight":0.9705,"kind":"semantic"},{"source":13,"target":16,"weight":0.9649,"kind":"semantic"},{"source":14,"target":13,"weight":0.9727,"kind":"semantic"},{"source":14,"target":15,"weight":0.9719,"kind":"semantic"},{"source":14,"target":17,"weight":0.9712,"kind":"semantic"},{"source":14,"target":16,"weight":0.9638,"kind":"semantic"},{"source":15,"target":17,"weight":0.9764,"kind":"semantic"},{"source":15,"target":14,"weight":0.9719,"kind":"semantic"},{"source":15,"target":13,"weight":0.9705,"kind":"semantic"},{"source":15,"target":16,"weight":0.9627,"kind":"semantic"},{"source":16,"target":13,"weight":0.9649,"kind":"semantic"},{"source":16,"target":14,"weight":0.9638,"kind":"semantic"},{"source":16,"target":15,"weight":0.9627,"kind":"semantic"},{"source":16,"target":17,"weight":0.9609,"kind":"semantic"},{"source":17,"target":15,"weight":0.9764,"kind":"semantic"},{"source":17,"target":14,"weight":0.9712,"kind":"semantic"},{"source":17,"target":13,"weight":0.9708,"kind":"semantic"},{"source":17,"target":16,"weight":0.9609,"kind":"semantic"},{"source":18,"target":24,"weight":1.0000,"kind":"link"},{"source":18,"target":23,"weight":0.9809,"kind":"semantic"},{"source":18,"target":22,"weight":0.9801,"kind":"semantic"},{"source":18,"target":20,"weight":0.9791,"kind":"semantic"},{"source":18,"target":21,"weight":0.9756,"kind":"semantic"},{"source":18,"target":19,"weight":0.9750,"kind":"semantic"},{"source":19,"target":22,"weight":0.9822,"kind":"semantic"},{"source":19,"target":23,"weight":0.9822,"kind":"semantic"},{"source":19,"target":21,"weight":0.9819,"kind":"semantic"},{"source":19,"target":20,"weight":0.9778,"kind":"semantic"},{"source":19,"target":18,"weight":0.9750,"kind":"semantic"},{"source":20,"target":22,"weight":0.9851,"kind":"semantic"},{"source":20,"target":23,"weight":0.9810,"kind":"semantic"},{"source":20,"target":18,"weight":0.9791,"kind":"semantic"},{"source":20,"target":21,"weight":0.9788,"kind":"semantic"},{"source":20,"target":19,"weight":0.9778,"kind":"semantic"},{"source":21,"target":22,"weight":0.9821,"kind":"semantic"},{"source":21,"target":19,"weight":0.9819,"kind":"semantic"},{"source":21,"target":23,"weight":0.9806,"kind":"semantic"},{"source":21,"target":20,"weight":0.9788,"kind":"semantic"},{"source":21,"target":18,"weight":0.9756,"kind":"semantic"},{"source":21,"target":27,"weight":0.3305,"kind":"semantic"},{"source":22,"target":20,"weight":0.9851,"kind":"semantic"},{"source":22,"target":23,"weight":0.9843,"kind":"semantic"},{"source":22,"target":19,"weight":0.9822,"kind":"semantic"},{"source":22,"target":21,"weight":0.9821,"kind":"semantic"},{"source":22,"target":18,"weight":0.9801,"kind":"semantic"},{"source":23,"target":22,"weight":0.9843,"kind":"semantic"},{"source":23,"target":19,"weight":0.9822,"kind":"semantic"},{"source":23,"target":20,"weight":0.9810,"kind":"semantic"},{"source":23,"target":18,"weight":0.9809,"kind":"semantic"},{"source":23,"target":21,"weight":0.9806,"kind":"semantic"},{"source":24,"target":26,"weight":0.9802,"kind":"semantic"},{"source":24,"target":29,"weight":0.9796,"kind":"semantic"},{"source":24,"target":28,"weight":0.9772,"kind":"semantic"},{"source":24,"target":27,"weight":0.9724,"kind":"semantic"},{"source":24,"target":25,"weight":0.9678,"kind":"semantic"},{"source":25,"target":27,"weight":0.9743,"kind":"semantic"},{"source":25,"target":24,"weight":0.9678,"kind":"semantic"},{"source":25,"target":28,"weight":0.9652,"kind":"semantic"},{"source":25,"target":26,"weight":0.9646,"kind":"semantic"},{"source":25,"target":29,"weight":0.9617,"kind":"semantic"},{"source":26,"target":24,"weight":0.9802,"kind":"semantic"},{"source":26,"target":29,"weight":0.9773,"kind":"semantic"},{"source":26,"target":27,"weight":0.9749,"kind":"semantic"},{"source":26,"target":28,"weight":0.9710,"kind":"semantic"},{"source":26,"target":25,"weight":0.9646,"kind":"semantic"},{"source":27,"target":26,"weight":0.9749,"kind":"semantic"},{"source":27,"target":25,"weight":0.9743,"kind":"semantic"},{"source":27,"target":24,"weight":0.9724,"kind":"semantic"},{"source":27,"target":28,"weight":0.9702,"kind":"semantic"},{"source":27,"target":29,"weight":0.9621,"kind":"semantic"},{"source":27,"target":21,"weight":0.3305,"kind":"semantic"},{"source":28,"target":24,"weight":0.9772,"kind":"semantic"},{"source":28,"target":26,"weight":0.9710,"kind":"semantic"},{"source":28,"target":27,"weight":0.9702,"kind":"semantic"},{"source":28,"target":29,"weight":0.9677,"kind":"semantic"},{"source":28,"target":25,"weight":0.9652,"kind":"semantic"},{"source":29,"target":24,"weight":0.9796,"kind":"semantic"},{"source":29,"target":26,"weight":0.9773,"kind":"semantic"},{"source":29,"target":28,"weight":0.9677,"kind":"semantic"},{"source":29,"target":27,"weight":0.9621,"kind":"semantic"},{"source":29,"target":25,"weight":0.9617,"kind":"semantic"},{"source":30,"target":31,"weight":0.9759,"kind":"semantic"},{"source":30,"target":33,"weight":0.9705,"kind":"semantic"},{"source":30,"target":34,"weight":0.9632,"kind":"semantic"},{"source":30,"target":32,"weight":0.9618,"kind":"semantic"},{"source":31,"target":33,"weight":0.9821,"kind":"semantic"},{"source":31,"target":34,"weight":0.9787,"kind":"semantic"},{"source":31,"target":30,"weight":0.9759,"kind":"semantic"},{"source":31,"target":32,"weight":0.9748,"kind":"semantic"},{"source":32,"target":31,"weight":0.9748,"kind":"semantic"},{"source":32,"target":33,"weight":0.9666,"kind":"semantic"},{"source":32,"target":30,"weight":0.9618,"kind":"semantic"},{"source":32,"target":34,"weight":0.9606,"kind":"semantic"},{"source":33,"target":31,"weight":0.9821,"kind":"semantic"},{"source":33,"target":34,"weight":0.9813,"kind":"semantic"},{"source":33,"target":30,"weight":0.9705,"kind":"semantic"},{"source":33,"target":32,"weight":0.9666,"kind":"semantic"},{"source":34,"target":33,"weight":0.9813,"kind":"semantic"},{"source":34,"target":31,"weight":0.9787,"kind":"semantic"},{"source":34,"target":30,"weight":0.9632,"kind":"semantic"},{"source":34,"target":32,"weight":0.9606,"kind":"semantic"},{"source":35,"target":37,"weight":0.9741,"kind":"semantic"},{"source":35,"target":36,"weight":0.9732,"kind":"semantic"},{"source":35,"target":39,"weight":0.9694,"kind":"semantic"},{"source":35,"target":38,"weight":0.9670,"kind":"semantic"},{"source":36,"target":38,"weight":0.9824,"kind":"semantic"},{"source":36,"target":35,"weight":0.9732,"kind":"semantic"},{"source":36,"target":37,"weight":0.9731,"kind":"semantic"},{"source":36,"target":39,"weight":0.9662,"kind":"semantic"},{"source":37,"target":39,"weight":0.9811,"kind":"semantic"},{"source":37,"target":35,"weight":0.9741,"kind":"semantic"},{"source":37,"target":36,"weight":0.9731,"kind":"semantic"},{"source":37,"target":38,"weight":0.9634,"kind":"semantic"},{"source":38,"target":36,"weight":0.9824,"kind":"semantic"},{"source":38,"target":35,"weight":0.9670,"kind":"semantic"},{"source":38,"target":39,"weight":0.9658,"kind":"semantic"},{"source":38,"target":37,"weight":0.9634,"kind":"semantic"},{"source":39,"target":37,"weight":0.9811,"kind":"semantic"},{"source":39,"target":35,"weight":0.9694,"kind":"semantic"},{"source":39,"target":36,"weight":0.9662,"kind":"semantic"},{"source":39,"target":38,"weight":0.9658,"kind":"semantic"},{"source":39,"target":8,"weight":0.2856,"kind":"semantic"},{"source":39,"target":7,"weight":0.2602,"kind":"semantic"},{"source":40,"target":42,"weight":0.9686,"kind":"semantic"},{"source":40,"target":43,"weight":0.9659,"kind":"semantic"},{"source":40,"target":44,"weight":0.9652,"kind":"semantic"},{"source":40,"target":41,"weight":0.9602,"kind":"semantic"},{"source":41,"target":43,"weight":0.9702,"kind":"semantic"},{"source":41,"target":40,"weight":0.9602,"kind":"semantic"},{"source":41,"target":44,"weight":0.9597,"kind":"semantic"},{"source":41,"target":42,"weight":0.9536,"kind":"semantic"},{"source":42,"target":40,"weight":0.9686,"kind":"semantic"},{"source":42,"target":43,"weight":0.9638,"kind":"semantic"},{"source":42,"target":44,"weight":0.9632,"kind":"semantic"},{"source":42,"target":41,"weight":0.9536,"kind":"semantic"},{"source":43,"target":41,"weight":0.9702,"kind":"semantic"},{"source":43,"target":40,"weight":0.9659,"kind":"semantic"},{"source":43,"target":42,"weight":0.9638,"kind":"semantic"},{"source":43,"target":44,"weight":0.9590,"kind":"semantic"},{"source":44,"target":40,"weight":0.9652,"kind":"semantic"},{"source":44,"target":42,"weight":0.9632,"kind":"semantic"},{"source":44,"target":41,"weight":0.9597,"kind":"semantic"},{"source":44,"target":43,"weight":0.9590,"kind":"semantic"}]};
+
+(() => {
+  "use strict";
+  const canvas = document.getElementById("graph");
+  const ctx = canvas.getContext("2d");
+  const root = document.documentElement;
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---- palette (read from CSS so themes drive the canvas) ----
+  let PAL = {};
+  function refreshPalette() {
+    const cs = getComputedStyle(root);
+    const g = (n) => cs.getPropertyValue(n).trim();
+    PAL = {
+      bg: g("--bg"), ink: g("--ink"), ink2: g("--ink-2"), ink3: g("--ink-3"),
+      accent: g("--accent"), edge: g("--edge"),
+      comm: [0,1,2,3,4,5,6,7].map((i) => g("--c" + i)),
+    };
+  }
+  refreshPalette();
+
+  // ---- state ----
+  let nodes = [], edges = [], adj = new Map(), id2n = new Map();
+  let tagCounts = new Map(), commCount = 0;
+  let view = { x: 0, y: 0, k: 1 };
+  let selected = null, hovered = null;
+  const tagFilter = new Set();
+  let commFilter = null, query = "";
+  let alpha = 1, dragNode = null, panning = null, moved = false;
+
+  const commColor = (c) => PAL.comm[c % PAL.comm.length];
+  const radius = (n) => 4 + 2.4 * Math.sqrt(n.degree);
+
+  function buildGraph(data) {
+    nodes = data.nodes.map((d, i) => ({
+      id: d.id, label: d.label || ("#" + d.id), tags: d.tags || [],
+      degree: d.degree || 0, community: d.community || 0,
+      x: Math.cos(i) * 60 + (i % 7) * 6, y: Math.sin(i) * 60 + (i % 5) * 6,
+      vx: 0, vy: 0, fx: null, fy: null,
+    }));
+    id2n = new Map(nodes.map((n) => [n.id, n]));
+    // directed adjacency (for the "related" list), weight-sorted
+    adj = new Map(nodes.map((n) => [n.id, []]));
+    // undirected unique edges (for layout + drawing)
+    const seen = new Map();
+    for (const e of data.edges) {
+      if (!id2n.has(e.source) || !id2n.has(e.target)) continue;
+      adj.get(e.source).push({ id: e.target, w: e.weight, kind: e.kind });
+      const key = e.source < e.target ? e.source + ":" + e.target : e.target + ":" + e.source;
+      const rank = { semantic: 0, link: 1, both: 2 }[e.kind] ?? 0;
+      const cur = seen.get(key);
+      if (!cur || e.weight > cur.w) seen.set(key, { a: e.source, b: e.target, w: e.weight, kind: e.kind, rank: Math.max(rank, cur ? cur.rank : 0) });
+      else cur.rank = Math.max(cur.rank, rank);
+    }
+    edges = [...seen.values()].map((e) => ({ a: id2n.get(e.a), b: id2n.get(e.b), w: e.w, link: e.rank >= 1 }));
+    for (const list of adj.values()) list.sort((x, y) => y.w - x.w);
+
+    tagCounts = new Map();
+    for (const n of nodes) for (const t of n.tags) tagCounts.set(t, (tagCounts.get(t) || 0) + 1);
+    commCount = new Set(nodes.map((n) => n.community)).size;
+
+    selected = null; hovered = null; tagFilter.clear(); commFilter = null; query = "";
+    alpha = 1;
+    renderPanel();
+    fitView();
+  }
+
+  // ---- force simulation ----
+  function tick() {
+    const REP = 2600, SPRING = 0.035, CENTER = 0.015, DAMP = 0.86;
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy || 0.01;
+        const f = (REP * alpha) / d2;
+        const d = Math.sqrt(d2);
+        const ux = dx / d, uy = dy / d;
+        a.vx += ux * f; a.vy += uy * f;
+        b.vx -= ux * f; b.vy -= uy * f;
+      }
+    }
+    for (const e of edges) {
+      const a = e.a, b = e.b;
+      let dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const rest = 34 + (1 - Math.min(e.w, 1)) * 150;
+      const f = SPRING * alpha * (d - rest);
+      const ux = dx / d, uy = dy / d;
+      a.vx += ux * f; a.vy += uy * f;
+      b.vx -= ux * f; b.vy -= uy * f;
+    }
+    for (const n of nodes) {
+      n.vx -= n.x * CENTER * alpha; n.vy -= n.y * CENTER * alpha;
+      n.vx *= DAMP; n.vy *= DAMP;
+      if (n.fx !== null) { n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0; }
+      else { n.x += n.vx; n.y += n.vy; }
+    }
+    alpha *= 0.985;
+    if (alpha < 0.02) alpha = 0.02;
+  }
+
+  // ---- matched / active sets for dimming ----
+  function isMatched(n) {
+    if (query && !n.label.toLowerCase().includes(query)) return false;
+    if (tagFilter.size && !n.tags.some((t) => tagFilter.has(t))) return false;
+    if (commFilter !== null && n.community !== commFilter) return false;
+    return true;
+  }
+  function focusSet() {
+    const f = hovered || selected;
+    if (!f) return null;
+    const s = new Set([f.id]);
+    for (const e of adj.get(f.id) || []) s.add(e.id);
+    for (const n of nodes) for (const e of adj.get(n.id) || []) if (e.id === f.id) s.add(n.id);
+    return s;
+  }
+
+  function draw() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr || canvas.height !== H * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = PAL.bg; ctx.fillRect(0, 0, W, H);
+    ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
+
+    const focus = focusSet();
+    const dimAll = tagFilter.size || commFilter !== null || query;
+
+    // edges
+    for (const e of edges) {
+      const mA = isMatched(e.a), mB = isMatched(e.b);
+      const inFocus = focus && (focus.has(e.a.id) && focus.has(e.b.id));
+      let alphaE, wLine, color;
+      if (e.link) { color = PAL.accent; wLine = 2.2; alphaE = 0.85; }
+      else { color = "rgb(" + PAL.edge + ")"; wLine = 0.6 + e.w * 1.8; alphaE = 0.12 + e.w * 0.28; }
+      if (focus) alphaE = inFocus ? Math.min(1, alphaE + 0.35) : alphaE * 0.12;
+      else if (dimAll && !(mA && mB)) alphaE *= 0.12;
+      ctx.globalAlpha = alphaE;
+      ctx.strokeStyle = color; ctx.lineWidth = wLine / view.k;
+      ctx.beginPath(); ctx.moveTo(e.a.x, e.a.y); ctx.lineTo(e.b.x, e.b.y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // nodes
+    for (const n of nodes) {
+      const r = radius(n);
+      const matched = isMatched(n);
+      const inFocus = !focus || focus.has(n.id);
+      let a = 1;
+      if (focus && !inFocus) a = 0.14;
+      else if (dimAll && !matched) a = 0.12;
+      ctx.globalAlpha = a;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = commColor(n.community); ctx.fill();
+      ctx.lineWidth = 1.2 / view.k; ctx.strokeStyle = PAL.bg; ctx.stroke();
+      // label when big enough on screen, or in focus / selected
+      const screenR = r * view.k;
+      if (screenR > 8 || n === hovered || n === selected || (focus && focus.has(n.id) && screenR > 5)) {
+        ctx.globalAlpha = a;
+        ctx.fillStyle = PAL.ink;
+        ctx.font = "600 " + (11 / view.k) + "px ui-sans-serif, system-ui, sans-serif";
+        ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText(n.label, n.x, n.y + r + 2 / view.k);
+      }
+    }
+    // selection ring
+    if (selected) {
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(selected.x, selected.y, radius(selected) + 4 / view.k, 0, Math.PI * 2);
+      ctx.strokeStyle = PAL.accent; ctx.lineWidth = 2 / view.k; ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function loop() {
+    if (!reduceMotion) tick();
+    draw();
+    requestAnimationFrame(loop);
+  }
+  function kindle(a = 0.5) { alpha = Math.max(alpha, a); if (reduceMotion) { for (let i = 0; i < 90; i++) tick(); } }
+
+  // ---- coordinate helpers ----
+  const toWorld = (sx, sy) => ({ x: (sx - view.x) / view.k, y: (sy - view.y) / view.k });
+  function nodeAt(sx, sy) {
+    const p = toWorld(sx, sy);
+    let best = null, bestD = Infinity;
+    for (const n of nodes) {
+      const r = radius(n) + 4 / view.k;
+      const dx = n.x - p.x, dy = n.y - p.y, d = dx * dx + dy * dy;
+      if (d < r * r && d < bestD) { best = n; bestD = d; }
+    }
+    return best;
+  }
+  function fitView() {
+    if (reduceMotion) for (let i = 0; i < 400; i++) tick();
+    // wait a couple frames for layout to spread, then frame it
+    setTimeout(() => {
+      if (!nodes.length) return;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const n of nodes) { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x); minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y); }
+      const W = canvas.clientWidth, H = canvas.clientHeight, pad = 90;
+      const rightRail = W > 720 ? 340 : 0;
+      const k = Math.min((W - rightRail - pad) / (maxX - minX || 1), (H - pad) / (maxY - minY || 1), 2.2);
+      view.k = Math.max(0.2, k);
+      view.x = (W - rightRail) / 2 - ((minX + maxX) / 2) * view.k;
+      view.y = H / 2 - ((minY + maxY) / 2) * view.k;
+    }, reduceMotion ? 0 : 350);
+  }
+
+  // ---- pointer ----
+  canvas.addEventListener("pointerdown", (ev) => {
+    canvas.setPointerCapture(ev.pointerId);
+    moved = false;
+    const n = nodeAt(ev.clientX, ev.clientY);
+    if (n) { dragNode = n; n.fx = n.x; n.fy = n.y; }
+    else panning = { x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y };
+  });
+  canvas.addEventListener("pointermove", (ev) => {
+    if (dragNode) {
+      const p = toWorld(ev.clientX, ev.clientY);
+      dragNode.fx = p.x; dragNode.fy = p.y; moved = true; kindle(0.4);
+    } else if (panning) {
+      view.x = panning.vx + (ev.clientX - panning.x); view.y = panning.vy + (ev.clientY - panning.y); moved = true;
+    } else {
+      const n = nodeAt(ev.clientX, ev.clientY);
+      if (n !== hovered) { hovered = n; updateTooltip(ev, n); }
+      else if (n) moveTooltip(ev);
+    }
+  });
+  function endPointer(ev) {
+    if (dragNode) { dragNode.fx = null; dragNode.fy = null; dragNode = null; }
+    if (panning && !moved) { selectNode(null); }
+    panning = null;
+  }
+  canvas.addEventListener("pointerup", (ev) => {
+    if (!moved) { const n = nodeAt(ev.clientX, ev.clientY); if (n) selectNode(n); }
+    endPointer(ev);
+  });
+  canvas.addEventListener("pointercancel", endPointer);
+  canvas.addEventListener("pointerleave", () => { hovered = null; tip.classList.remove("show"); });
+  canvas.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const f = Math.exp(-ev.deltaY * 0.0012);
+    const p = toWorld(ev.clientX, ev.clientY);
+    view.k = Math.max(0.15, Math.min(6, view.k * f));
+    view.x = ev.clientX - p.x * view.k; view.y = ev.clientY - p.y * view.k;
+  }, { passive: false });
+
+  // ---- tooltip ----
+  const tip = document.getElementById("tooltip");
+  function updateTooltip(ev, n) {
+    if (!n) { tip.classList.remove("show"); return; }
+    tip.textContent = n.label; tip.classList.add("show"); moveTooltip(ev);
+  }
+  function moveTooltip(ev) { tip.style.left = ev.clientX + "px"; tip.style.top = ev.clientY + "px"; }
+
+  // ---- selection + panel ----
+  function selectNode(n) { selected = n; renderDetail(); kindle(0.25); }
+
+  const $ = (id) => document.getElementById(id);
+  function renderPanel() {
+    $("s-nodes").textContent = nodes.length;
+    $("s-edges").textContent = edges.length;
+    $("s-comm").textContent = commCount;
+
+    const tags = $("tags"); tags.innerHTML = "";
+    [...tagCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).forEach(([t, c]) => {
+      const el = document.createElement("button");
+      el.className = "chip" + (tagFilter.has(t) ? " on" : "");
+      el.innerHTML = t + ' <span class="n">' + c + "</span>";
+      el.onclick = () => { tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); renderPanel(); kindle(0.2); };
+      tags.appendChild(el);
+    });
+
+    const comm = $("communities"); comm.innerHTML = "";
+    const counts = new Map();
+    for (const n of nodes) counts.set(n.community, (counts.get(n.community) || 0) + 1);
+    [...counts.entries()].sort((a, b) => a[0] - b[0]).forEach(([c, n]) => {
+      const el = document.createElement("div");
+      el.className = "legrow" + (commFilter === c ? " on" : "");
+      el.innerHTML = '<span class="dot" style="background:' + commColor(c) + '"></span><span>Cluster ' + (c + 1) + '</span><span class="n">' + n + "</span>";
+      el.onclick = () => { commFilter = commFilter === c ? null : c; renderPanel(); kindle(0.2); };
+      comm.appendChild(el);
+    });
+  }
+  function renderDetail() {
+    const d = $("detail");
+    if (!selected) { d.classList.remove("show"); return; }
+    d.classList.add("show");
+    $("d-title").textContent = selected.label;
+    $("d-deg").textContent = selected.degree + " links";
+    $("d-comm").textContent = "cluster " + (selected.community + 1);
+    const tg = $("d-tags"); tg.innerHTML = "";
+    selected.tags.forEach((t) => {
+      const c = document.createElement("button");
+      c.className = "chip" + (tagFilter.has(t) ? " on" : "");
+      c.textContent = t;
+      c.onclick = () => { tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); renderPanel(); kindle(0.2); };
+      tg.appendChild(c);
+    });
+    const rel = $("d-rel"); rel.innerHTML = "";
+    const list = (adj.get(selected.id) || []).slice(0, 12);
+    if (!list.length) rel.innerHTML = '<span style="color:var(--ink-3);font-size:12px">No outgoing edges.</span>';
+    for (const e of list) {
+      const t = id2n.get(e.id); if (!t) continue;
+      const item = document.createElement("div"); item.className = "relitem";
+      const w = Math.max(2, Math.round(Math.min(e.w, 1) * 100));
+      item.innerHTML = '<div class="rt">' + escapeHtml(t.label) + (e.kind !== "semantic" ? ' 🔗' : '') +
+        '</div><div class="rw">' + e.w.toFixed(3) + '</div><div class="relbar"><i style="width:' + w + '%"></i></div>';
+      item.onclick = () => { selectNode(t); };
+      rel.appendChild(item);
+    }
+  }
+  function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+  // ---- controls ----
+  $("search").addEventListener("input", (e) => { query = e.target.value.trim().toLowerCase(); kindle(0.15); });
+  $("reset-view").onclick = () => { fitView(); };
+  $("toggle").onclick = () => $("panel").classList.toggle("hidden");
+
+  // load sheet
+  const sheet = $("sheet");
+  $("open-load").onclick = () => { $("load-err").textContent = ""; sheet.classList.add("show"); };
+  $("cancel-load").onclick = () => sheet.classList.remove("show");
+  $("load-sample").onclick = () => { buildGraph(SAMPLE); sheet.classList.remove("show"); };
+  $("file").addEventListener("change", (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    f.text().then((t) => { $("paste").value = t; });
+  });
+  $("do-load").onclick = () => {
+    try {
+      const data = JSON.parse($("paste").value);
+      if (!data.nodes || !data.edges) throw new Error("JSON needs `nodes` and `edges` arrays.");
+      buildGraph(data); sheet.classList.remove("show");
+    } catch (err) { $("load-err").textContent = "Couldn't parse that: " + err.message; }
+  };
+
+  // theme changes → recolor canvas
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refreshPalette);
+  new MutationObserver(refreshPalette).observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+  addEventListener("resize", () => {});
+
+  // ---- go ----
+  buildGraph(SAMPLE || { nodes: [], edges: [] });
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

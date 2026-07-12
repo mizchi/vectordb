@@ -115,6 +115,19 @@ let applied = gi.insert_auto_tagged(id, &emb, title, &opts); // 提案タグを�
 `analytics::pagerank(&g, iters, damping)` で重み付き PageRank をノードごとに算出（グラフビューの
 ノードサイズ・ランキング用）。`analytics::degrees` と `communities_label_propagation` と併用する。
 
+## グラフビュー UI（`viewer/`）
+
+`viewer/index.html` は依存ゼロ・単一ファイルの **Obsidian 風グラフビュー**（Canvas 力学配置）。
+`export` した JSON をそのまま読み込む。コミュニティで色分け・次数でノードサイズ・意味エッジ/明示リンクを
+描き分け、ノードクリックで関連ノート（重み付き）、タグ/コミュニティで絞り込み、検索、ドラッグ/ズーム/パン。
+ライト/ダーク両対応。
+
+```bash
+graphdb export kb.graphdb --communities > graph.json
+# viewer/index.html をブラウザで開く → 「Load your export…」で graph.json を読み込む
+# （サンプルデータを同梱しているので、そのまま開くだけでも動く）
+```
+
 ## CLI
 
 ```bash
