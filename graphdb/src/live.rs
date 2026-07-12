@@ -122,6 +122,51 @@ impl GraphIndex {
         self.links.insert((src, dst));
     }
 
+    /// Suggest tags for a new note's `embedding` from its tagged neighbors in
+    /// the current graph (kNN vote). Does not modify the graph.
+    pub fn suggest_tags(
+        &self,
+        embedding: &[f32],
+        opts: &crate::classify::SuggestOpts,
+    ) -> Vec<crate::classify::TagSuggestion> {
+        let Some(h) = &self.hnsw else {
+            return Vec::new();
+        };
+        let hits = h.search(embedding, opts.k, opts.ef);
+        let nbrs = hits.iter().filter_map(|hit| {
+            self.meta
+                .get(&hit.id)
+                .map(|m| (m.tags.as_slice(), hit.score))
+        });
+        crate::classify::score_tags(nbrs, opts)
+    }
+
+    /// Auto-tag then insert: suggest tags from the current graph, apply them,
+    /// insert the node, and return the applied tags. The classic
+    /// "new article arrives → classify → file it" flow.
+    pub fn insert_auto_tagged(
+        &mut self,
+        id: u64,
+        embedding: &[f32],
+        title: String,
+        opts: &crate::classify::SuggestOpts,
+    ) -> Vec<String> {
+        let tags: Vec<String> = self
+            .suggest_tags(embedding, opts)
+            .into_iter()
+            .map(|s| s.tag)
+            .collect();
+        self.insert(
+            id,
+            embedding,
+            NodeMeta {
+                title,
+                tags: tags.clone(),
+            },
+        );
+        tags
+    }
+
     /// Freeze into an immutable [`GraphStore`]: merge semantic + link edges
     /// (overlaps become [`EdgeKind::Both`]), sort each node's edges by weight,
     /// cap at `max_degree`, and attach metadata. Nodes are ordered by ascending
@@ -266,6 +311,39 @@ mod tests {
             rel.iter().all(|n| n.id >= 4),
             "node 0 should now sit in cluster B"
         );
+    }
+
+    #[test]
+    fn auto_tag_new_note() {
+        let items = clustered();
+        let mut gi = GraphIndex::new(Metric::Cosine, 3);
+        gi.min_weight = 0.8;
+        // Tag cluster A "a", cluster B "b".
+        for (id, v) in &items {
+            let tag = if *id < 4 { "a" } else { "b" };
+            gi.insert(
+                *id,
+                v,
+                NodeMeta {
+                    title: String::new(),
+                    tags: vec![tag.into()],
+                },
+            );
+        }
+        // A new note near cluster B should be auto-tagged "b".
+        let newvec: Vec<f32> = items[6].1.clone();
+        let opts = crate::classify::SuggestOpts {
+            k: 3,
+            min_score: 0.5,
+            ..Default::default()
+        };
+        let sugg = gi.suggest_tags(&newvec, &opts);
+        assert_eq!(sugg[0].tag, "b", "expected tag b, got {sugg:?}");
+
+        let applied = gi.insert_auto_tagged(99, &newvec, "new".into(), &opts);
+        assert_eq!(applied, vec!["b".to_string()]);
+        let g = gi.freeze();
+        assert_eq!(g.tags(99), vec!["b"]);
     }
 
     #[test]

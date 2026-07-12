@@ -29,10 +29,12 @@
 
 pub mod analytics;
 pub mod build;
+pub mod classify;
 pub mod graph;
 pub mod live;
 
 pub use build::GraphBuilder;
+pub use classify::{SuggestOpts, TagClassifier, TagSuggestion};
 pub use graph::{EdgeKind, GraphStore, Neighbor, NodeMeta, Subgraph};
 pub use live::GraphIndex;
 

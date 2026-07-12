@@ -23,3 +23,7 @@ path = "examples/graph_view.rs"
 [[example]]
 name = "live_update"
 path = "examples/live_update.rs"
+
+[[example]]
+name = "auto_tag"
+path = "examples/auto_tag.rs"

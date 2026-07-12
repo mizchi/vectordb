@@ -18,7 +18,7 @@
 //! Vectors CSV: `id,v0,v1,...`. Links CSV: `src_id,dst_id`.
 //! Meta TSV:    `id<TAB>title<TAB>tag1,tag2,...` (title/tags optional).
 
-use graphdb::{analytics, GraphBuilder, GraphStore, NodeMeta};
+use graphdb::{analytics, GraphBuilder, GraphStore, NodeMeta, SuggestOpts, TagClassifier};
 use std::collections::HashSet;
 use std::process::ExitCode;
 use vectordb::cli::{flag_value, has_flag, parse_csv, parse_flag, parse_metric};
@@ -34,10 +34,12 @@ fn main() -> ExitCode {
         Some("neighborhood") => neighborhood(rest),
         Some("tags") => tags(rest),
         Some("by-tag") => by_tag(rest),
+        Some("suggest-tags") => suggest_tags(rest),
         Some("export") => export(rest),
         Some("info") => info(rest),
         _ => Err(
-            "usage: graphdb <build-graph|related|neighborhood|tags|by-tag|export|info> ...".into(),
+            "usage: graphdb <build-graph|related|neighborhood|tags|by-tag|suggest-tags|export|info> ..."
+                .into(),
         ),
     };
     match r {
@@ -200,6 +202,41 @@ fn by_tag(args: &[String]) -> Result<(), String> {
     let g = GraphStore::load(&args[0]).map_err(|e| e.to_string())?;
     for id in g.nodes_with_tag(&args[1]) {
         println!("{id}\t{}", g.title(id).unwrap_or(""));
+    }
+    Ok(())
+}
+
+/// Auto-classify new notes: build a classifier from labeled embeddings
+/// (`vecs.csv` + `meta.tsv`) and suggest tags for each query embedding.
+fn suggest_tags(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err(
+            "suggest-tags <vecs.csv> <meta.tsv> <query.csv> [--k N] [--min-score S] [--max-tags N]"
+                .into(),
+        );
+    }
+    let metric: Metric = flag_value(args, "--metric").map_or(Ok(Metric::Cosine), parse_metric)?;
+    let items = read_records(&args[0])?;
+    let meta = read_meta(&args[1])?;
+    let tag_of: std::collections::HashMap<u64, Vec<String>> =
+        meta.into_iter().map(|(id, m)| (id, m.tags)).collect();
+    let labeled: Vec<(u64, Vec<f32>, Vec<String>)> = items
+        .into_iter()
+        .map(|(id, v)| (id, v, tag_of.get(&id).cloned().unwrap_or_default()))
+        .collect();
+    let clf = TagClassifier::build(&labeled, metric);
+
+    let opts = SuggestOpts {
+        k: parse_flag(args, "--k", 10)?,
+        max_tags: parse_flag(args, "--max-tags", 5)?,
+        min_score: parse_flag(args, "--min-score", 0.15)?,
+        ..Default::default()
+    };
+    let queries = read_records(&args[2])?;
+    for (qid, v) in &queries {
+        for s in clf.suggest(v, &opts) {
+            println!("{qid}\t{}\t{:.3}\t{}", s.tag, s.score, s.votes);
+        }
     }
     Ok(())
 }

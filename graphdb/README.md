@@ -83,6 +83,38 @@ g.save("kb.graphdb")?;
 （ナレッジベースでは低類似度の「関連」は不要なので実運用でも推奨）。デモ:
 `cargo run -p graphdb --example live_update`。
 
+### 自動タグ付け / 分類（`TagClassifier`）
+
+新しい記事のタグを、**意味的近傍のタグの加重投票**で推定する（外部 ML 不要）。新記事を埋め込み、
+既存のタグ付きノートの kNN を取り、類似度を各タグへの票として集計する。`score` は「近傍の類似度質量の
+うちそのタグが占める割合」なので `[0,1]` に収まり閾値化しやすい（＝ kNN マルチラベル分類）。
+
+```rust
+use graphdb::{TagClassifier, SuggestOpts};
+use vectordb::Metric;
+
+// 既存の (id, 埋め込み, タグ) から分類器を構築
+let clf = TagClassifier::build(&labeled, Metric::Cosine);
+let opts = SuggestOpts { k: 8, max_tags: 3, min_score: 0.2, ..Default::default() };
+for s in clf.suggest(&new_embedding, &opts) {
+    println!("{} (conf {:.2}, {} votes)", s.tag, s.score, s.votes);
+}
+```
+
+live グラフに統合した「届いた記事を分類して即ファイル」フロー:
+
+```rust
+let sugg = gi.suggest_tags(&emb, &opts);                    // グラフを変えずに提案だけ
+let applied = gi.insert_auto_tagged(id, &emb, title, &opts); // 提案タグを付けて挿入
+```
+
+デモ: `cargo run -p graphdb --example auto_tag`。
+
+### 重要度（PageRank）
+
+`analytics::pagerank(&g, iters, damping)` で重み付き PageRank をノードごとに算出（グラフビューの
+ノードサイズ・ランキング用）。`analytics::degrees` と `communities_label_propagation` と併用する。
+
 ## CLI
 
 ```bash
@@ -96,6 +128,8 @@ $G neighborhood kb.graphdb 42 --depth 2 --max 50 [--tag rust]
 $G tags         kb.graphdb                       # count<TAB>tag（降順）
 $G by-tag       kb.graphdb rust                  # そのタグの id<TAB>title
 $G export       kb.graphdb --communities > graph.json
+# 新記事の自動タグ付け（vecs+meta で分類器を作り、query の各行にタグ提案）
+$G suggest-tags vecs.csv meta.tsv new.csv --k 8 --min-score 0.2   # qid<TAB>tag<TAB>score<TAB>votes
 ```
 
 - `notes.csv`: `id,v0,v1,...`（埋め込み。vecdb と同じ形式）
@@ -117,9 +151,10 @@ $G export       kb.graphdb --communities > graph.json
 - 実装済み: 意味 kNN 構築 / mutual-kNN・閾値枝刈り / 明示リンク統合 / related（タグフィルタ可）/
   neighborhood（タグフィルタ可）/ **ノードメタデータ（title + tags, 永続化）** / タグ検索
   （nodes_with_tag / by-tag / tag_counts）/ JSON エクスポート（label+tags+community）/
-  degree・label-propagation コミュニティ / `.graphdb` 永続化 / CLI /
-  **インクリメンタル更新（`GraphIndex`: upsert / edit / remove → freeze）**。
-- 今後: タグ間の共起グラフ、PageRank、mmap ゼロコピー読み、大規模時の `search_batch` 並列構築、
+  degree・label-propagation コミュニティ・**PageRank** / `.graphdb` 永続化 / CLI /
+  **インクリメンタル更新（`GraphIndex`: upsert / edit / remove → freeze）** /
+  **自動タグ付け（`TagClassifier` / `suggest_tags` / `insert_auto_tagged`）**。
+- 今後: タグ間の共起グラフ、mmap ゼロコピー読み、大規模時の `search_batch` 並列構築、
   live グラフの永続化（現状 `GraphIndex` は再構築でロード）。
 
 ## ライセンス
