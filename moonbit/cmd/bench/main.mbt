@@ -34,8 +34,8 @@ fn rand_vec(rng : Rng, dim : Int) -> Array[Float] {
 ///|
 /// recall@k of `got` vs the exact-truth hit list.
 fn recall_of(
-  got : Array[Array[@vectordb.Hit]],
-  truth : Array[Array[@vectordb.Hit]],
+  got : Array[Array[@meandb.Hit]],
+  truth : Array[Array[@meandb.Hit]],
   nq : Int,
 ) -> Double {
   let mut hit = 0
@@ -91,8 +91,8 @@ fn main {
   let per = fn(us : Double) -> Double { us / 1000.0 / nq.to_double() }
 
   // Flat exact f32 = ground truth.
-  let flat = @vectordb.FlatIndex::build(vectors, ids, @vectordb.Cosine, true)
-  let exact : Array[Array[@vectordb.Hit]] = []
+  let flat = @meandb.FlatIndex::build(vectors, ids, @meandb.Cosine, true)
+  let exact : Array[Array[@meandb.Hit]] = []
   let t_ex = @perf.monotonic_clock_start()
   for q in queries {
     exact.push(flat.search_exact(q, k))
@@ -102,7 +102,7 @@ fn main {
   println("flat exact f32        : \{per(us_exact)} ms/q  recall=1.0000")
 
   // Flat int8 + rerank.
-  let got : Array[Array[@vectordb.Hit]] = []
+  let got : Array[Array[@meandb.Hit]] = []
   let t0 = @perf.monotonic_clock_start()
   for q in queries {
     got.push(flat.search(q, k, 8))
@@ -113,15 +113,15 @@ fn main {
   )
 
   // IVF.
-  let ivf = @vectordb.IvfIndex::build(
+  let ivf = @meandb.IvfIndex::build(
     vectors,
     ids,
-    @vectordb.Cosine,
+    @meandb.Cosine,
     0,
     true,
     12,
   )
-  let g_ivf : Array[Array[@vectordb.Hit]] = []
+  let g_ivf : Array[Array[@meandb.Hit]] = []
   let t_ivf = @perf.monotonic_clock_start()
   for q in queries {
     g_ivf.push(ivf.search(q, k, 16, 8))
@@ -132,16 +132,16 @@ fn main {
   )
 
   // PQ (m=16 -> 16 bytes/vector = 32x).
-  let pq = @vectordb.PqIndex::build(
+  let pq = @meandb.PqIndex::build(
     vectors,
     ids,
-    @vectordb.Cosine,
+    @meandb.Cosine,
     16,
     256,
     15,
     true,
   )
-  let g_pq : Array[Array[@vectordb.Hit]] = []
+  let g_pq : Array[Array[@meandb.Hit]] = []
   let t_pq = @perf.monotonic_clock_start()
   for q in queries {
     g_pq.push(pq.search(q, k, 16))
@@ -152,17 +152,17 @@ fn main {
   )
 
   // OPQ.
-  let opq = @vectordb.OpqIndex::build(
+  let opq = @meandb.OpqIndex::build(
     vectors,
     ids,
-    @vectordb.Cosine,
+    @meandb.Cosine,
     16,
     256,
     15,
     3,
     true,
   )
-  let g_opq : Array[Array[@vectordb.Hit]] = []
+  let g_opq : Array[Array[@meandb.Hit]] = []
   let t_opq = @perf.monotonic_clock_start()
   for q in queries {
     g_opq.push(opq.search(q, k, 16))
@@ -173,17 +173,17 @@ fn main {
   )
 
   // IVF+PQ.
-  let ipq = @vectordb.IvfPqIndex::build(
+  let ipq = @meandb.IvfPqIndex::build(
     vectors,
     ids,
-    @vectordb.Cosine,
+    @meandb.Cosine,
     0,
     16,
     256,
     12,
     true,
   )
-  let g_ipq : Array[Array[@vectordb.Hit]] = []
+  let g_ipq : Array[Array[@meandb.Hit]] = []
   let t_ipq = @perf.monotonic_clock_start()
   for q in queries {
     g_ipq.push(ipq.search(q, k, 16, 16))
@@ -194,11 +194,11 @@ fn main {
   )
 
   // HNSW.
-  let hnsw = @vectordb.HnswIndex::new(dim, @vectordb.Cosine, 16, 200)
+  let hnsw = @meandb.HnswIndex::new(dim, @meandb.Cosine, 16, 200)
   for i in 0..<n {
     hnsw.add(ids[i], vectors[i])
   }
-  let g_h : Array[Array[@vectordb.Hit]] = []
+  let g_h : Array[Array[@meandb.Hit]] = []
   let t_h = @perf.monotonic_clock_start()
   for q in queries {
     g_h.push(hnsw.search(q, k, 64))
@@ -209,11 +209,11 @@ fn main {
   )
 
   // int8-graph HNSW.
-  let hq = @vectordb.HnswQIndex::new(dim, @vectordb.Cosine, 16, 200, true)
+  let hq = @meandb.HnswQIndex::new(dim, @meandb.Cosine, 16, 200, true)
   for i in 0..<n {
     hq.add(ids[i], vectors[i])
   }
-  let g_hq : Array[Array[@vectordb.Hit]] = []
+  let g_hq : Array[Array[@meandb.Hit]] = []
   let t_hq = @perf.monotonic_clock_start()
   for q in queries {
     g_hq.push(hq.search(q, k, 64))

@@ -9,7 +9,7 @@ fn main {
     [0.0, 0.0, 1.0, 0.0],
   ]
   let ids : Array[Int64] = [10L, 20L, 30L, 40L]
-  let idx = @vectordb.FlatIndex::build(vectors, ids, @vectordb.Cosine, true)
+  let idx = @meandb.FlatIndex::build(vectors, ids, @meandb.Cosine, true)
   println("built \{idx.length()} vectors, raw kept = \{idx.has_raw()}")
   let hits = idx.search([1.0, 0.05, 0.0, 0.0], 3, 4)
   println("query ~ [1, 0.05, 0, 0], top-3 (cosine, int8 scan + f32 rerank):")

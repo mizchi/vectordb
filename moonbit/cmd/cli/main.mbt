@@ -1,5 +1,5 @@
 ///|
-/// Runnable demo of the environment-agnostic vectordb CLI.
+/// Runnable demo of the environment-agnostic meandb vector CLI.
 ///
 /// MoonBit's argv/fs access is not portable across backends, so instead of
 /// reading real files this wires the CLI core (`@cli.run`) to a `MemFs` adapter

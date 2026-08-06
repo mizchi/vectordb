@@ -8,7 +8,7 @@ fn main {
     [0.0, 0.0, 1.0],
   ]
   let ids : Array[Int64] = [1L, 2L, 3L]
-  let idx = @vectordb.IvfIndex::build(vectors, ids, @vectordb.L2, 3, true, 1)
+  let idx = @meandb.IvfIndex::build(vectors, ids, @meandb.L2, 3, true, 1)
   let bytes = idx.to_bytes()
   let parts : Array[String] = []
   for i in 0..<bytes.length() {

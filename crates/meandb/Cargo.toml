@@ -1,0 +1,21 @@
+[package]
+name = "meandb"
+version = "0.1.0"
+edition.workspace = true
+description = "Meaning-aware database composed from vector search and semantic graph layers"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/meandb"
+readme = "README.md"
+keywords = ["vector", "graph", "semantic", "search", "database"]
+categories = ["algorithms", "data-structures", "database"]
+rust-version.workspace = true
+
+[dependencies]
+meandb-vector = { version = "0.1.0", path = "../vector" }
+meandb-graph = { version = "0.1.0", path = "../graph" }
+
+[features]
+default = ["parallel"]
+parallel = ["meandb-vector/parallel", "meandb-graph/parallel"]

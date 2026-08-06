@@ -1,4 +1,4 @@
-name = "mizchi/vectordb"
+name = "mizchi/meandb"
 
 version = "0.1.0"
 

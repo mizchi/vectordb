@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["rust", "graphdb"]
+members = ["crates/vector", "crates/graph", "crates/meandb", "integration/consumer"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mizchi/meandb"
+homepage = "https://github.com/mizchi/meandb"
+rust-version = "1.87"
 
 # Profiles must live in the workspace root (member-level profiles are ignored).
 [profile.release]

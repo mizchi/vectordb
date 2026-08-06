@@ -1,5 +1,5 @@
 import {
-  "mizchi/vectordb/cli",
+  "mizchi/meandb/cli",
 }
 
 options(

@@ -1,5 +1,5 @@
 ///|
-/// A small, environment-agnostic CLI for the vectordb library. All IO goes
+/// A small, environment-agnostic CLI for the meandb vector layer. All IO goes
 /// through the injected `Io` adapter, so the exact same command logic runs on
 /// native, wasm, js, or inside a host with no filesystem (see `MemFs`).
 ///
@@ -111,11 +111,11 @@ fn int_flag(args : Array[String], name : String, default : Int) -> Int {
 }
 
 ///|
-fn parse_metric(args : Array[String]) -> @vectordb.Metric {
+fn parse_metric(args : Array[String]) -> @meandb.Metric {
   match flag_value(args, "--metric") {
-    Some("l2") | Some("L2") => @vectordb.L2
-    Some("dot") | Some("ip") => @vectordb.Dot
-    _ => @vectordb.Cosine
+    Some("l2") | Some("L2") => @meandb.L2
+    Some("dot") | Some("ip") => @meandb.Dot
+    _ => @meandb.Cosine
   }
 }
 
@@ -211,15 +211,15 @@ fn cmd_build(io : Io, args : Array[String]) -> Int {
   let keep_raw = !has_flag(args, "--compact")
   let kind = flag_value(args, "--index").unwrap_or("flat")
   let out : FixedArray[Byte] = match kind {
-    "flat" => @vectordb.FlatIndex::build(vecs, ids, metric, keep_raw).to_bytes()
+    "flat" => @meandb.FlatIndex::build(vecs, ids, metric, keep_raw).to_bytes()
     "ivf" => {
       let nlist = int_flag(args, "--nlist", 256)
-      @vectordb.IvfIndex::build(vecs, ids, metric, nlist, keep_raw, 12).to_bytes()
+      @meandb.IvfIndex::build(vecs, ids, metric, nlist, keep_raw, 12).to_bytes()
     }
     "hnsw" => {
       let m = int_flag(args, "-m", 16)
       let efc = int_flag(args, "--ef-construction", 200)
-      let idx = @vectordb.HnswIndex::new(vecs[0].length(), metric, m, efc)
+      let idx = @meandb.HnswIndex::new(vecs[0].length(), metric, m, efc)
       for i in 0..<vecs.length() {
         idx.add(ids[i], vecs[i])
       }
@@ -228,7 +228,7 @@ fn cmd_build(io : Io, args : Array[String]) -> Int {
     "hnsw-q" => {
       let m = int_flag(args, "-m", 16)
       let efc = int_flag(args, "--ef-construction", 200)
-      let idx = @vectordb.HnswQIndex::new(
+      let idx = @meandb.HnswQIndex::new(
         vecs[0].length(),
         metric,
         m,
@@ -243,20 +243,20 @@ fn cmd_build(io : Io, args : Array[String]) -> Int {
     "pq" => {
       let m = int_flag(args, "--pq-m", 16)
       let ksub = int_flag(args, "--ksub", 256)
-      @vectordb.PqIndex::build(vecs, ids, metric, m, ksub, 20, keep_raw).to_bytes()
+      @meandb.PqIndex::build(vecs, ids, metric, m, ksub, 20, keep_raw).to_bytes()
     }
     "ivfpq" => {
       let nlist = int_flag(args, "--nlist", 256)
       let m = int_flag(args, "--pq-m", 16)
       let ksub = int_flag(args, "--ksub", 256)
-      @vectordb.IvfPqIndex::build(
+      @meandb.IvfPqIndex::build(
         vecs, ids, metric, nlist, m, ksub, 15, keep_raw,
       ).to_bytes()
     }
     "opq" => {
       let m = int_flag(args, "--pq-m", 16)
       let ksub = int_flag(args, "--ksub", 256)
-      @vectordb.OpqIndex::build(vecs, ids, metric, m, ksub, 20, 4, keep_raw).to_bytes()
+      @meandb.OpqIndex::build(vecs, ids, metric, m, ksub, 20, 4, keep_raw).to_bytes()
     }
     other => {
       (io.print)("error: unknown --index " + other)
@@ -292,33 +292,33 @@ fn cmd_search(io : Io, args : Array[String]) -> Int {
     (io.print)("error: unrecognized index file (bad magic)")
     return 1
   }
-  let search_one : (Array[Float]) -> Array[@vectordb.Hit] = match kind {
+  let search_one : (Array[Float]) -> Array[@meandb.Hit] = match kind {
     "flat" => {
-      let idx = @vectordb.FlatIndex::from_bytes(idx_bytes)
+      let idx = @meandb.FlatIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, over) }
     }
     "ivf" => {
-      let idx = @vectordb.IvfIndex::from_bytes(idx_bytes)
+      let idx = @meandb.IvfIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, nprobe, over) }
     }
     "hnsw" => {
-      let idx = @vectordb.HnswIndex::from_bytes(idx_bytes)
+      let idx = @meandb.HnswIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, ef) }
     }
     "hnsw-q" => {
-      let idx = @vectordb.HnswQIndex::from_bytes(idx_bytes)
+      let idx = @meandb.HnswQIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, ef) }
     }
     "pq" => {
-      let idx = @vectordb.PqIndex::from_bytes(idx_bytes)
+      let idx = @meandb.PqIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, over) }
     }
     "ivfpq" => {
-      let idx = @vectordb.IvfPqIndex::from_bytes(idx_bytes)
+      let idx = @meandb.IvfPqIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, nprobe, over) }
     }
     _ => {
-      let idx = @vectordb.OpqIndex::from_bytes(idx_bytes)
+      let idx = @meandb.OpqIndex::from_bytes(idx_bytes)
       fn(q) { idx.search(q, k, over) }
     }
   }
@@ -348,13 +348,13 @@ fn cmd_info(io : Io, args : Array[String]) -> Int {
     return 1
   }
   let count = match kind {
-    "flat" => @vectordb.FlatIndex::from_bytes(b).length()
-    "ivf" => @vectordb.IvfIndex::from_bytes(b).length()
-    "hnsw" => @vectordb.HnswIndex::from_bytes(b).length()
-    "hnsw-q" => @vectordb.HnswQIndex::from_bytes(b).length()
-    "pq" => @vectordb.PqIndex::from_bytes(b).length()
-    "ivfpq" => @vectordb.IvfPqIndex::from_bytes(b).length()
-    _ => @vectordb.OpqIndex::from_bytes(b).length()
+    "flat" => @meandb.FlatIndex::from_bytes(b).length()
+    "ivf" => @meandb.IvfIndex::from_bytes(b).length()
+    "hnsw" => @meandb.HnswIndex::from_bytes(b).length()
+    "hnsw-q" => @meandb.HnswQIndex::from_bytes(b).length()
+    "pq" => @meandb.PqIndex::from_bytes(b).length()
+    "ivfpq" => @meandb.IvfPqIndex::from_bytes(b).length()
+    _ => @meandb.OpqIndex::from_bytes(b).length()
   }
   (io.print)("type:  " + kind)
   (io.print)("count: \{count}")

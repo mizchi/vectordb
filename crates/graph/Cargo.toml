@@ -1,0 +1,50 @@
+[package]
+name = "meandb-graph"
+autobins = false
+version = "0.1.0"
+edition.workspace = true
+description = "Semantic graph layer for meandb: kNN + explicit links, weighted, mmap single-file"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/meandb-graph"
+readme = "README.md"
+keywords = ["graph", "knowledge-graph", "vector", "search"]
+categories = ["algorithms", "data-structures", "database"]
+rust-version.workspace = true
+
+[lib]
+# `meandb_graph` is the internal graph layer used by the umbrella facade.
+name = "meandb_graph"
+path = "src/lib.rs"
+
+[dependencies]
+# Publish against the registry package, but keep the workspace dependency for
+# local development. The version is explicit so Cargo validates it.
+meandb-vector = { version = "0.1.0", path = "../vector" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["parallel"]
+parallel = ["meandb-vector/parallel"]
+
+[[bin]]
+name = "meandb"
+path = "src/bin/meandb.rs"
+
+[[bin]]
+name = "graphdb"
+path = "src/bin/graphdb.rs"
+
+[[example]]
+name = "graph_view"
+path = "examples/graph_view.rs"
+
+[[example]]
+name = "live_update"
+path = "examples/live_update.rs"
+
+[[example]]
+name = "auto_tag"
+path = "examples/auto_tag.rs"

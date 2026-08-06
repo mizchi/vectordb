@@ -1,7 +1,13 @@
-# vectordb
+# meandb
 
-コンパクトで組み込み向けのベクトル検索データベース。**Rust**（本命実装）と
-**MoonBit**（`v128` SIMD 版の試作）の二本立てで、同じ設計・同じ `.vecdb` ファイル形式を共有する。
+意味を扱うための、組み込み向けデータベース。`meandb` は二つの内部 layer を
+ひとつの公開 API にまとめる。
+
+- **vector** — vector index、ANN、SIMD 距離、`.vecdb` 永続化
+- **graph** — 明示リンク、タグ、探索、構造化クエリ、`.graphdb` 永続化
+
+ベクトル layer は **Rust**（本命実装）と **MoonBit**（`v128` SIMD 版の試作）の
+二本立てで、同じ設計・同じ `.vecdb` ファイル形式を共有する。
 
 - **11 種のインデックス** — Flat / IVF / HNSW / int8-HNSW / PQ / OPQ / IVF+PQ / Binary / RaBitQ / IVF+RaBitQ / DiskANN
 - **3 メトリクス** — `L2`（二乗距離）/ `Dot`（内積）/ `Cosine`（挿入時に正規化）
@@ -12,9 +18,11 @@
 > このページは**使い方ガイド**。アルゴリズム・設計の経緯・ファイル形式の詳細は
 > [`DESIGN.md`](./DESIGN.md) を参照。
 
-> **関連クレート**: [`graphdb`](./graphdb) — vectordb の上に載る意味的ナレッジグラフ
-> （kNN + 明示リンクの重み付きグラフ、関連記事・Obsidian 風グラフビュー向け）。
-> リポジトリは Cargo workspace（`rust` = vectordb, `graphdb`）。
+> **workspace**: [`crates/meandb`](./crates/meandb) が公開 facade、
+> [`crates/vector`](./crates/vector) が vector layer、
+> [`crates/graph`](./crates/graph) が意味的ナレッジグラフ layer である。
+> layer は個別リリースできるが、通常の Rust 利用者は `meandb::{vector, graph}`
+> を使う。
 
 ---
 
@@ -35,23 +43,26 @@
 
 ## インストール
 
-Rust 実装は `rust/` にある。ワークスペースではなく単体クレート。
+Rust 実装は Cargo workspace の `crates/vector` と `crates/graph` にある。
 
 ```bash
-cd rust
-cargo build --release           # ライブラリ + CLI (target/release/vecdb)
-cargo test                      # ユニット/結合テスト + doctest
+cargo build --workspace --release
+cargo test --workspace
 ```
 
 依存は最小（`memmap2`、既定で `rayon`）。スレッド並列が不要なら
 `--no-default-features` で `rayon` ごと外せる（`search` / `search_exact` はそのまま動く）。
 
-同じリポジトリの別クレートから使う場合:
+crates.io から使う場合:
 
 ```toml
 [dependencies]
-vectordb = { path = "../vectordb/rust" }
+meandb = "0.1"
 ```
+
+vector と graph の責務は分離される。`meandb::graph` は
+`meandb::vector` を使って意味エッジを構築するが、vector index にグラフの
+リンク、タグ、トラバーサル、分析は持ち込まない。
 
 ---
 
@@ -60,7 +71,7 @@ vectordb = { path = "../vectordb/rust" }
 ### ライブラリ（30 秒）
 
 ```rust
-use vectordb::{FlatIndex, Metric, save, open};
+use meandb::vector::{FlatIndex, Metric, save, open};
 
 // 1) 索引を作って追加
 let mut idx = FlatIndex::new(128, Metric::Cosine, /*keep_raw=*/true);
@@ -84,7 +95,7 @@ L2 は負の二乗距離）。
 入力は CSV（1 行 = `id,v0,v1,...`）。索引種別は検索時にファイル先頭のマジックで**自動判定**。
 
 ```bash
-V="cargo run --release --bin vecdb --"
+V="cargo run --release -p meandb-vector --bin meandb-vector --"
 $V build  vecs.csv index.vecdb --metric cosine     # Flat 索引を構築
 $V info   index.vecdb                              # 種別・件数・次元などを表示
 $V search index.vecdb query.csv -k 10              # 各行: query_index<TAB>rank<TAB>id<TAB>score
@@ -125,7 +136,7 @@ $V search index.vecdb query.csv -k 10              # 各行: query_index<TAB>ran
 Flat は `save` / `open`（mmap）/ `load`（所有）、他の索引は型ごとの `save` / `load` を持つ。
 
 ```rust
-use vectordb::{FlatIndex, Metric, save, open};
+use meandb::vector::{FlatIndex, Metric, save, open};
 
 let mut idx = FlatIndex::new(dim, Metric::Cosine, true);
 for (id, v) in &items { idx.add(*id, v); }
@@ -195,7 +206,7 @@ DiskANN はグラフ隣接と生 f32 を mmap のまま検索し、RAM には PQ
 **構築時にも生ベクトルを全部 RAM に載せない**低メモリ構築を提供する。
 
 ```rust
-use vectordb::{DiskAnnIndex, Metric};
+use meandb::vector::{DiskAnnIndex, Metric};
 
 // 生ベクトルを一度も全常駐させずに .vecdb を構築（items は所有イテレータ＝実ストリーム源でも可）
 DiskAnnIndex::build_streaming(
@@ -449,7 +460,7 @@ $V search da.vecdb    query.csv -k 10 --ef 64          # DiskANN は --ef = l_se
 | `search` | `-k` `--oversample` `--nprobe` `--ef` | 種別自動判定 |
 | `info` | — | 種別・件数・次元・メトリクスなど |
 
-### IO 抽象化で任意の環境に組み込む（`vectordb::cli`）
+### IO 抽象化で任意の環境に組み込む（`meandb::vector::cli`）
 
 CLI のコマンドロジックは `Env` トレイト（`read` / `write` / `print` / `eprint`）越しにしか
 IO しない。索引は**バイト API**（各索引の `to_bytes` / `from_bytes`）で入出力するのでパスに触れず、
@@ -460,7 +471,7 @@ IO しない。索引は**バイト API**（各索引の `to_bytes` / `from_byte
 - 独自環境は `Env` を実装すれば差し込める（オブジェクトストレージ、`fetch` など）。
 
 ```rust
-use vectordb::cli::{run, MemEnv};
+use meandb::vector::cli::{run, MemEnv};
 
 let mut env = MemEnv::new();
 env.put_str("vecs.csv", "0,1,0,0\n1,0,1,0\n2,0.9,0.1,0\n");
@@ -555,12 +566,12 @@ moon run cmd/bench --target native --release   # 統合ベンチ（recall/ms/que
 ```
 
 ```moonbit
-let idx = @vectordb.FlatIndex::build(vectors, ids, @vectordb.Cosine, true)
+let idx = @meandb.FlatIndex::build(vectors, ids, @meandb.Cosine, true)
 let hits = idx.search(query, 10, 4)   // Array[Hit{ id, score }]
 
 // .vecdb シリアライズ（Rust とバイト互換）
 let bytes = idx.to_bytes()                    // FixedArray[Byte]
-let restored = @vectordb.FlatIndex::from_bytes(bytes)
+let restored = @meandb.FlatIndex::from_bytes(bytes)
 
 // フィルタ付き検索（全索引）
 let hits = flat.search_filter(query, 10, 4, fn(id) { id % 2L == 0L })
@@ -625,7 +636,7 @@ MoonBit の wasm ランタイムにファイルシステムは無いため、入
 
 ## プロジェクト構成
 
-### Rust（`rust/src`）
+### Rust vector layer（`crates/vector/src`）
 
 - `distance.rs` — f32/int8 距離（スカラ + AVX2, int8 は 32 要素/反復）
 - `quantize.rs` — int8 スカラ量子化

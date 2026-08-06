@@ -1,0 +1,11 @@
+[package]
+name = "release-consumer-contract"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+# This crate intentionally uses the dependency declarations a crates.io
+# consumer writes. It is not a third public library.
+[dependencies]
+meandb = { path = "../../crates/meandb" }
